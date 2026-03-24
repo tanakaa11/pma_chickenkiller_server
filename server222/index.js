@@ -1724,6 +1724,7 @@ app.get('/pma/doctors', async (req, res) => {
   await delay(300);
   const { ids } = req.query;
   const { practiceId, isSuperAdmin } = req.userContext || {};
+  console.log(`Fetching doctors for practiceId=${practiceId}, isSuperAdmin=${isSuperAdmin}, filterIds=${ids || 'none'}`);
 
   // If not super admin, filter to doctors linked to the user's practice
   if (!isSuperAdmin && practiceId) {
@@ -1760,6 +1761,7 @@ app.get('/pma/doctors', async (req, res) => {
 
 app.get('/pma/doctors/:id', async (req, res) => {
   await delay(200);
+  console.log(`Fetching doctor with id=${req.params.id}`);
   const { data: doctor } = await supabase
     .from('doctors').select('*').eq('id', req.params.id).single();
   if (!doctor) return res.status(404).json(err('Doctor not found'));
@@ -1768,6 +1770,7 @@ app.get('/pma/doctors/:id', async (req, res) => {
 
 app.get('/pma/doctors/available', async (req, res) => {
   await delay(300);
+  console.log(`Fetching available doctors for date=${req.query.date}, time=${req.query.time}`);
   const { date, time } = req.query;
   const { data: doctors } = await supabase.from('doctors').select('*').eq('is_available', true);
   if (!date) return res.json(success((doctors || []).map(toCamel)));
@@ -1788,6 +1791,7 @@ app.get('/pma/doctors/available', async (req, res) => {
 
 app.get('/pma/doctors/:id/schedule', async (req, res) => {
   await delay(300);
+  console.log(`Fetching schedule for doctor with id=${req.params.id}`);
   const { dateFrom, dateTo } = req.query;
   let query = supabase.from('schedules').select('*').eq('doctor_id', req.params.id);
   if (dateFrom) query = query.gte('date', dateFrom);
@@ -1868,6 +1872,7 @@ app.get('/pma/schedules/doctor/:doctorId/slots/:date', async (req, res) => {
 
 app.get('/pma/appointments', async (req, res) => {
   await delay(300);
+  console.log(`Fetching appointments with filters: ${JSON.stringify(req.query)}`);1``
   const { page, pageSize, status, doctorId, patientId, dateFrom, dateTo, lean } = req.query;
   const { practiceId, isSuperAdmin } = req.userContext;
   
@@ -1940,6 +1945,7 @@ app.get('/pma/appointments', async (req, res) => {
 
 app.get('/pma/appointments/:id', async (req, res) => {
   await delay(200);
+  console.log(`Fetching appointment with id=${req.params.id}`);
   const { data: apt } = await supabase
     .from('appointments').select(APPOINTMENT_SELECT).eq('id', req.params.id).single();
   if (!apt) return res.status(404).json(err('Appointment not found'));
@@ -1948,6 +1954,7 @@ app.get('/pma/appointments/:id', async (req, res) => {
 
 app.get('/pma/appointments/patient/:patientId', async (req, res) => {
   await delay(300);
+  console.log(`Fetching appointments for patientId=${req.params.patientId}`);
   const { data: apts } = await supabase
     .from('appointments').select(APPOINTMENT_SELECT).eq('patient_id', req.params.patientId);
   res.json(success((apts || []).map(formatAppointment)));
@@ -1955,6 +1962,7 @@ app.get('/pma/appointments/patient/:patientId', async (req, res) => {
 
 app.get('/pma/appointments/doctor/:doctorId', async (req, res) => {
   await delay(300);
+  console.log(`Fetching appointments for doctorId=${req.params.doctorId}`);
   const { data: apts } = await supabase
     .from('appointments').select(APPOINTMENT_SELECT).eq('doctor_id', req.params.doctorId);
   res.json(success((apts || []).map(formatAppointment)));
@@ -1962,6 +1970,7 @@ app.get('/pma/appointments/doctor/:doctorId', async (req, res) => {
 
 app.post('/pma/appointments', async (req, res) => {
   await delay(400);
+  console.log(`Booking new appointment with data: ${JSON.stringify(req.body)}`);
   const data = req.body;
   const { data: conflict } = await supabase.from('appointments').select('id')
     .eq('doctor_id', data.doctorId).eq('date', data.date).eq('start_time', data.startTime)
@@ -1994,6 +2003,7 @@ app.post('/pma/appointments', async (req, res) => {
 app.post('/pma/appointments/:id/approve-reception', async (req, res) => {
   await delay(300);
   const { userId } = req.body;
+  console.log(`Approving reception for appointment id=${req.params.id} by userId=${userId}`);
   const { data: apt } = await supabase.from('appointments').select('id, status').eq('id', req.params.id).maybeSingle();
   if (!apt) return res.status(404).json(err('Appointment not found'));
   if (apt.status !== 'pending_reception') return res.status(400).json(err('Appointment is not pending reception approval'));
@@ -2006,6 +2016,7 @@ app.post('/pma/appointments/:id/approve-reception', async (req, res) => {
 
 app.post('/pma/appointments/:id/approve-doctor', async (req, res) => {
   await delay(300);
+  console.log(`Approving doctor for appointment id=${req.params.id} by userId=${req.body.userId}`);
   const { userId } = req.body;
   const { data: apt } = await supabase.from('appointments').select('id').eq('id', req.params.id).maybeSingle();
   if (!apt) return res.status(404).json(err('Appointment not found'));
@@ -2017,6 +2028,7 @@ app.post('/pma/appointments/:id/approve-doctor', async (req, res) => {
 });
 
 app.post('/pma/appointments/:id/reject', async (req, res) => {
+  console.log(`Rejecting appointment id=${req.params.id} with reason: ${req.body.reason}`);
   await delay(300);
   const { reason } = req.body;
   const { data: apt } = await supabase.from('appointments').select('id').eq('id', req.params.id).maybeSingle();
@@ -2029,6 +2041,7 @@ app.post('/pma/appointments/:id/reject', async (req, res) => {
 
 app.post('/pma/appointments/:id/cancel', async (req, res) => {
   await delay(300);
+  console.log(`Cancelling appointment id=${req.params.id} with reason: ${req.body.reason}`);
   const { data: apt } = await supabase.from('appointments').select('id').eq('id', req.params.id).maybeSingle();
   if (!apt) return res.status(404).json(err('Appointment not found'));
   const { data: updated } = await supabase.from('appointments')
@@ -2039,6 +2052,7 @@ app.post('/pma/appointments/:id/cancel', async (req, res) => {
 
 app.patch('/pma/appointments/:id', async (req, res) => {
   await delay(300);
+  console.log(`Updating appointment id=${req.params.id} with data: ${JSON.stringify(req.body)}`);
   const { data: apt } = await supabase.from('appointments').select('id').eq('id', req.params.id).maybeSingle();
   if (!apt) return res.status(404).json(err('Appointment not found'));
   const upd = { updated_at: new Date().toISOString() };
@@ -2070,6 +2084,7 @@ const enrichPP = (pp, usersMap) => {
 
 app.get('/pma/practice', async (req, res) => {
   await delay(200);
+  console.log(`Fetching practice info for userContext: ${JSON.stringify(req.userContext)}`);
 
   // Determine which practice to load — use the user's current practice context
   let practiceId = req.userContext?.practiceId;
@@ -2129,6 +2144,7 @@ app.get('/pma/practice', async (req, res) => {
 
 app.get('/pma/practice/practitioners', async (req, res) => {
   await delay(200);
+  console.log(`Fetching practice practitioners for userContext: ${JSON.stringify(req.userContext)}`);
   const [{ data: pps }, { data: allUsers }] = await Promise.all([
     supabase.from('practice_practitioners').select('*'),
     supabase.from('users').select('id, first_name, last_name, email'),
@@ -2139,6 +2155,7 @@ app.get('/pma/practice/practitioners', async (req, res) => {
 
 app.get('/pma/practice/practitioners/:id', async (req, res) => {
   await delay(200);
+  console.log(`Fetching practice practitioner with id=${req.params.id} for userContext: ${JSON.stringify(req.userContext)}`);
   const [{ data: pp }, { data: allUsers }] = await Promise.all([
     supabase.from('practice_practitioners').select('*').eq('id', req.params.id).maybeSingle(),
     supabase.from('users').select('id, first_name, last_name, email'),
@@ -2154,6 +2171,7 @@ app.get('/pma/practice/practitioners/:id', async (req, res) => {
 
 app.get('/pma/visits', async (req, res) => {
   await delay(300);
+  console.log(`Fetching visits with filters: ${JSON.stringify(req.query)} for userContext: ${JSON.stringify(req.userContext)}`);
   const { patientId, doctorId, dateFrom, dateTo, status } = req.query;
   let query = supabase.from('visits').select(VISIT_SELECT);
   if (patientId) query = query.eq('patient_id', patientId);
@@ -2169,6 +2187,7 @@ app.get('/pma/visits', async (req, res) => {
 
 app.get('/pma/visits/:id', async (req, res) => {
   await delay(200);
+  console.log(`Fetching visit with id=${req.params.id} for userContext: ${JSON.stringify(req.userContext)}`);
   const { data: visit } = await supabase.from('visits').select(VISIT_SELECT).eq('id', req.params.id).maybeSingle();
   if (!visit) return res.status(404).json(err('Visit not found'));
   res.json(success(await enrichVisit(formatVisit(visit))));
@@ -2176,6 +2195,7 @@ app.get('/pma/visits/:id', async (req, res) => {
 
 app.get('/pma/visits/patient/:patientId', async (req, res) => {
   await delay(300);
+  console.log(`Fetching visits for patientId=${req.params.patientId} and userContext: ${JSON.stringify(req.userContext)}`);
   const { data: visits } = await supabase.from('visits').select(VISIT_SELECT)
     .eq('patient_id', req.params.patientId).order('visit_date', { ascending: false });
   const enriched = await Promise.all((visits || []).map(v => enrichVisit(formatVisit(v))));
@@ -2184,6 +2204,8 @@ app.get('/pma/visits/patient/:patientId', async (req, res) => {
 
 app.get('/pma/visits/doctor/:doctorId', async (req, res) => {
   await delay(300);
+  console.log(`Fetching visits for doctorId=${req.params.doctorId} and userContext: ${JSON.stringify(req.userContext)}`);
+
   const { data: visits } = await supabase.from('visits').select(VISIT_SELECT)
     .eq('doctor_id', req.params.doctorId).order('visit_date', { ascending: false });
   const enriched = await Promise.all((visits || []).map(v => enrichVisit(formatVisit(v))));
@@ -2192,6 +2214,7 @@ app.get('/pma/visits/doctor/:doctorId', async (req, res) => {
 
 app.get('/pma/visits/appointment/:appointmentId', async (req, res) => {
   await delay(200);
+  console.log(`Fetching visit for appointmentId=${req.params.appointmentId} and userContext: ${JSON.stringify(req.userContext)}`);
   const { data: visit } = await supabase.from('visits').select(VISIT_SELECT)
     .eq('appointment_id', req.params.appointmentId).maybeSingle();
   if (!visit) return res.status(404).json(err('No visit found for this appointment'));
@@ -2200,6 +2223,7 @@ app.get('/pma/visits/appointment/:appointmentId', async (req, res) => {
 
 app.post('/pma/visits', async (req, res) => {
   await delay(400);
+  console.log(`Creating new visit with data: ${JSON.stringify(req.body)} and userContext: ${JSON.stringify(req.userContext)}`);
   const data = req.body;
   const now = new Date().toISOString();
   const visitId = `visit-${Date.now()}`;
@@ -2248,6 +2272,7 @@ app.post('/pma/visits', async (req, res) => {
 
 app.put('/pma/visits/:id', async (req, res) => {
   await delay(300);
+  console.log(`Updating visit id=${req.params.id} with data: ${JSON.stringify(req.body)} and userContext: ${JSON.stringify(req.userContext)}`);
   const { data: existing } = await supabase.from('visits').select('id').eq('id', req.params.id).maybeSingle();
   if (!existing) return res.status(404).json(err('Visit not found'));
   const now  = new Date().toISOString();
@@ -2283,6 +2308,7 @@ app.put('/pma/visits/:id', async (req, res) => {
 });
 
 app.post('/pma/visits/:id/complete', async (req, res) => {
+  console.log(`Completing visit id=${req.params.id} with userContext: ${JSON.stringify(req.userContext)}`);
   await delay(400);
   const { data: visit } = await supabase.from('visits').select(VISIT_SELECT).eq('id', req.params.id).maybeSingle();
   if (!visit) return res.status(404).json(err('Visit not found'));
@@ -2312,6 +2338,7 @@ app.post('/pma/visits/:id/complete', async (req, res) => {
 
 app.get('/pma/patients/:id/clinical-record', async (req, res) => {
   await delay(300);
+  console.log(`Fetching clinical record for patientId=${req.params.id} with userContext: ${JSON.stringify(req.userContext)}`);
   const { data: visits } = await supabase.from('visits').select(VISIT_SELECT)
     .eq('patient_id', req.params.id).order('visit_date', { ascending: false });
   const enriched = await Promise.all((visits || []).map(v => enrichVisit(formatVisit(v))));
@@ -2324,12 +2351,15 @@ app.get('/pma/patients/:id/clinical-record', async (req, res) => {
 
 app.get('/pma/invoices', async (req, res) => {
   await delay(300);
+  console.log(`Fetching all invoices with userContext: ${JSON.stringify(req.userContext)}`);
+
   const { data: invoices } = await supabase.from('invoices').select(INVOICE_SELECT);
   res.json(success((invoices || []).map(formatInvoice)));
 });
 
 app.get('/pma/invoices/:id', async (req, res) => {
   await delay(200);
+  console.log(`Fetching invoice with id=${req.params.id} for userContext: ${JSON.stringify(req.userContext)}`);
   const { data: invoice } = await supabase.from('invoices').select(INVOICE_SELECT).eq('id', req.params.id).maybeSingle();
   if (!invoice) return res.status(404).json(err('Invoice not found'));
   res.json(success(formatInvoice(invoice)));
@@ -2337,6 +2367,7 @@ app.get('/pma/invoices/:id', async (req, res) => {
 
 app.get('/pma/invoices/visit/:visitId', async (req, res) => {
   await delay(200);
+  console.log(`Fetching invoice for visitId=${req.params.visitId} and userContext: ${JSON.stringify(req.userContext)}`);
   const { data: invoice } = await supabase.from('invoices').select(INVOICE_SELECT).eq('visit_id', req.params.visitId).maybeSingle();
   if (!invoice) return res.status(404).json(err('Invoice not found for this visit'));
   res.json(success(formatInvoice(invoice)));
@@ -2344,12 +2375,14 @@ app.get('/pma/invoices/visit/:visitId', async (req, res) => {
 
 app.get('/pma/invoices/patient/:patientId', async (req, res) => {
   await delay(300);
+  console.log(`Fetching invoices for patientId=${req.params.patientId} and userContext: ${JSON.stringify(req.userContext)}`);
   const { data: invoices } = await supabase.from('invoices').select(INVOICE_SELECT).eq('patient_id', req.params.patientId);
   res.json(success((invoices || []).map(formatInvoice)));
 });
 
 app.post('/pma/invoices/:id/mark-paid', async (req, res) => {
   await delay(300);
+  console.log(`Marking invoice id=${req.params.id} as paid with userContext: ${JSON.stringify(req.userContext)}`);
   const { data: inv } = await supabase.from('invoices').select('id').eq('id', req.params.id).maybeSingle();
   if (!inv) return res.status(404).json(err('Invoice not found'));
   const { data: updated } = await supabase.from('invoices')
@@ -2364,6 +2397,8 @@ app.post('/pma/invoices/:id/mark-paid', async (req, res) => {
 
 app.get('/pma/codes/diagnoses', async (req, res) => {
   await delay(200);
+  console.log(`Fetching diagnosis codes with query=${req.query.q} and userContext: ${JSON.stringify(req.userContext)}`);
+
   const { q } = req.query;
   let query = supabase.from('diagnosis_codes').select('*');
   if (q) query = query.or(`code.ilike.%${q}%,description.ilike.%${q}%`);
@@ -2373,6 +2408,8 @@ app.get('/pma/codes/diagnoses', async (req, res) => {
 
 app.get('/pma/codes/procedures', async (req, res) => {
   await delay(200);
+  console.log(`Fetching procedure codes with query=${req.query.q} and userContext: ${JSON.stringify(req.userContext)}`);
+
   const { q } = req.query;
   let query = supabase.from('procedure_codes').select('*');
   if (q) query = query.or(`code.ilike.%${q}%,description.ilike.%${q}%`);
@@ -2386,6 +2423,7 @@ app.get('/pma/codes/procedures', async (req, res) => {
 
 app.post('/pma/appointments/:id/start-consultation', async (req, res) => {
   await delay(300);
+  console.log("start consultation")
   const { data: apt } = await supabase.from('appointments').select('id, status').eq('id', req.params.id).maybeSingle();
   if (!apt) return res.status(404).json(err('Appointment not found'));
   if (apt.status !== 'confirmed') return res.status(400).json(err('Only confirmed appointments can start consultation'));
@@ -2403,6 +2441,7 @@ const otpStore = new Map();
 
 app.post('/pma/otp/send', async (req, res) => {
   await delay(500);
+  console.log(`Sending OTP to phone: ${req.body.phone}`);
   const { phone } = req.body;
   if (!phone) return res.status(400).json(err('Phone number is required'));
   const code = String(Math.floor(100000 + Math.random() * 900000));
@@ -2413,6 +2452,7 @@ app.post('/pma/otp/send', async (req, res) => {
 
 app.post('/pma/otp/verify', async (req, res) => {
   await delay(300);
+  console.log(`Verifying OTP for phone: ${req.body.phone} with code: ${req.body.code}`);
   const { phone, code } = req.body;
   if (!phone || !code) return res.status(400).json(err('Phone and code are required'));
   const stored = otpStore.get(phone);
@@ -2433,6 +2473,8 @@ app.post('/pma/otp/verify', async (req, res) => {
 // ============================================================================
 
 app.post('/pma/auth/update-password', async (req, res) => {
+  console.log(`Updating password for email: ${req.body.email}`);
+
   const { email, newPassword } = req.body;
   if (!email || !newPassword) return res.status(400).json(err('Email and new password are required'));
   if (newPassword.length < 6) return res.status(400).json(err('Password must be at least 6 characters long'));
