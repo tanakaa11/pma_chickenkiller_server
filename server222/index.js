@@ -810,6 +810,7 @@ app.get('/auth/me',     meHandler);
 
 app.get('/pma/users', async (req, res) => {
   await delay(300);
+  console.log('Fetching users with query:', req.query);
   const { page, pageSize } = req.query;
   const { data: users, error: dbErr } = await supabase.from('users').select(USER_SELECT);
   if (dbErr) return res.status(500).json(err('Failed to fetch users'));
@@ -1872,7 +1873,7 @@ app.get('/pma/schedules/doctor/:doctorId/slots/:date', async (req, res) => {
 
 app.get('/pma/appointments', async (req, res) => {
   await delay(300);
-  console.log(`Fetching appointments with filters: ${JSON.stringify(req.query)}`);1``
+  console.log(`Fetching appointments with filters: ${JSON.stringify(req.query)}`);
   const { page, pageSize, status, doctorId, patientId, dateFrom, dateTo, lean } = req.query;
   const { practiceId, isSuperAdmin } = req.userContext;
   
