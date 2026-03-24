@@ -60,10 +60,10 @@ const extractUserIdFromToken = (req) => {
 const addPracticeFilter = async (req, res, next) => {
   // Skip for auth routes, public routes, user profile endpoints, and admin functions
   const skipPaths = [
-    '/auth/', '/pma/auth/', 
-    '/practices', '/pma/practices',
-    '/users/check-email', '/pma/users/check-email',
-    '/admin/', '/pma/admin/'
+    '/auth/', '/pma/auth/', '/api/auth/',
+    '/practices', '/pma/practices', '/api/practices',
+    '/users/check-email', '/pma/users/check-email', '/api/users/check-email',
+    '/admin/', '/pma/admin/', '/api/admin/'
   ];
   
   // Check if this is a skip path first
@@ -80,9 +80,9 @@ const addPracticeFilter = async (req, res, next) => {
   
   // Skip user's own profile and practice checking endpoints
   const userProfilePaths = [
-    `/users/${userId}/my-practice`, `/pma/users/${userId}/my-practice`,
-    `/users/${userId}/my-practices`, `/pma/users/${userId}/my-practices`,
-    `/users/${userId}`, `/pma/users/${userId}`
+    `/users/${userId}/my-practice`, `/pma/users/${userId}/my-practice`, `/api/users/${userId}/my-practice`,
+    `/users/${userId}/my-practices`, `/pma/users/${userId}/my-practices`, `/api/users/${userId}/my-practices`,
+    `/users/${userId}`, `/pma/users/${userId}`, `/api/users/${userId}`
   ];
   
   if (userProfilePaths.some(path => req.path === path)) {
