@@ -1516,14 +1516,8 @@ app.post('/pma/practices/verify-otp', async (req, res) => {
 app.get('/pma/patients', async (req, res) => {
   await delay(300);
   const { page, pageSize, search, idNumber, ids } = req.query;
-  const { practiceId, isSuperAdmin } = req.userContext;
   
   let query = supabase.from('patients').select(PATIENT_SELECT);
-  
-  // Add practice filtering (unless super admin)
-  if (!isSuperAdmin) {
-    query = query.eq('practice_id', practiceId);
-  }
   
   if (ids) {
     query = query.in('id', ids.split(','));
@@ -1553,13 +1547,9 @@ app.get('/pma/patients/search', async (req, res) => {
   const { q } = req.query;
   console.log(`🔍 Patient search query: "${q}"`);
   if (!q) return res.json(success([]));
-  const { practiceId, isSuperSuperAdmin } = req.userContext;
   let query = supabase
     .from('patients').select(PATIENT_SELECT)
     .or(`first_name.ilike.%${q}%,last_name.ilike.%${q}%,id_number.ilike.%${q}%,email.ilike.%${q}%,phone.ilike.%${q}%`);
-  if (!isSuperSuperAdmin || practiceId) {
-    query = query.eq('practice_id', practiceId);
-  }
   const { data: patients } = await query;
   const results = (patients || []).map(formatPatient);
   results.sort((a, b) => {
