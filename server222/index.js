@@ -1553,9 +1553,14 @@ app.get('/pma/patients/search', async (req, res) => {
   const { q } = req.query;
   console.log(`🔍 Patient search query: "${q}"`);
   if (!q) return res.json(success([]));
-  const { data: patients } = await supabase
+  const { practiceId, isSuperSuperAdmin } = req.userContext;
+  let query = supabase
     .from('patients').select(PATIENT_SELECT)
     .or(`first_name.ilike.%${q}%,last_name.ilike.%${q}%,id_number.ilike.%${q}%,email.ilike.%${q}%,phone.ilike.%${q}%`);
+  if (!isSuperSuperAdmin || practiceId) {
+    query = query.eq('practice_id', practiceId);
+  }
+  const { data: patients } = await query;
   const results = (patients || []).map(formatPatient);
   results.sort((a, b) => {
     const qL = q.toLowerCase();
@@ -1875,12 +1880,12 @@ app.get('/pma/appointments', async (req, res) => {
   await delay(300);
   console.log(`Fetching appointments with filters: ${JSON.stringify(req.query)}`);
   const { page, pageSize, status, doctorId, patientId, dateFrom, dateTo, lean } = req.query;
-  const { practiceId, isSuperAdmin } = req.userContext;
+  const { practiceId, isSuperAdmin, isSuperSuperAdmin } = req.userContext;
   
   let query = supabase.from('appointments').select(lean === 'true' ? '*' : APPOINTMENT_SELECT);
   
-  // Add practice filtering via doctor or patient practice (unless super admin)
-  if (!isSuperAdmin) {
+  // Only bypass practice filtering for super_super_admin with no practice scope
+  if (!isSuperSuperAdmin || practiceId) {
     // Filter appointments by doctors linked to the user's practice
     const { data: practitionerIds } = await supabase
       .from('practice_practitioners')
