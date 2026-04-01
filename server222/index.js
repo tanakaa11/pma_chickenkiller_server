@@ -1198,15 +1198,15 @@ app.post('/pma/admin/link-user-to-practice', async (req, res) => {
   let inviteLink = '';
   if (isNewUser) {
     const token = `invite-${Date.now()}-${user.id}`;
-    // Store invite token so /pma/auth/signup/verify/:token and /pma/auth/set-password can find it
-    if (!global.inviteTokenStore) global.inviteTokenStore = new Map();
     const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000; // 7 days
-    global.inviteTokenStore.set(token, {
-      userId: user.id,
+    // Persist invite token in DB so it survives server restarts
+    await supabase.from('invite_tokens').upsert({
+      token,
+      user_id: user.id,
       email: user.email,
-      firstName: user.first_name,
-      lastName: user.last_name,
-      expiresAt,
+      first_name: user.first_name,
+      last_name: user.last_name,
+      expires_at: expiresAt,
     });
     const clientUrl = process.env.CLIENT_URL || 'http://localhost:8080';
     inviteLink = `${clientUrl}/set-password?token=${token}`;
@@ -1434,11 +1434,17 @@ app.post('/pma/admin/create-and-invite', async (req, res) => {
     });
   }
 
-  // Generate invite token
+  // Generate invite token — stored in DB so it survives server restarts
   const token = `invite-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
   const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000; // 7 days
-  if (!global.inviteTokenStore) global.inviteTokenStore = new Map();
-  global.inviteTokenStore.set(token, { userId: newId, email: email.toLowerCase(), firstName, lastName, expiresAt });
+  await supabase.from('invite_tokens').insert({
+    token,
+    user_id: newId,
+    email: email.toLowerCase(),
+    first_name: firstName,
+    last_name: lastName,
+    expires_at: expiresAt,
+  });
 
   const clientUrl = process.env.CLIENT_URL || 'http://localhost:8080';
   const inviteLink = `${clientUrl}/set-password?token=${token}`;
@@ -1450,14 +1456,14 @@ app.post('/pma/admin/create-and-invite', async (req, res) => {
 // Verify invite token
 app.get('/pma/auth/signup/verify/:token', async (req, res) => {
   await delay(200);
-  if (!global.inviteTokenStore) return res.status(404).json(err('Invalid or expired invite token'));
-  const stored = global.inviteTokenStore.get(req.params.token);
-  if (!stored) return res.status(404).json(err('Invalid or expired invite token'));
-  if (Date.now() > stored.expiresAt) {
-    global.inviteTokenStore.delete(req.params.token);
+  const { data: stored, error: tErr } = await supabase
+    .from('invite_tokens').select('*').eq('token', req.params.token).maybeSingle();
+  if (tErr || !stored) return res.status(404).json(err('Invalid or expired invite token'));
+  if (Date.now() > stored.expires_at) {
+    await supabase.from('invite_tokens').delete().eq('token', req.params.token);
     return res.status(410).json(err('Invite link has expired. Please request a new invite.'));
   }
-  res.json(success({ firstName: stored.firstName, lastName: stored.lastName, email: stored.email }));
+  res.json(success({ firstName: stored.first_name, lastName: stored.last_name, email: stored.email }));
 });
 
 // Set password via invite token
@@ -1466,16 +1472,16 @@ app.post('/pma/auth/set-password', async (req, res) => {
   const { token, password } = req.body;
   if (!token || !password) return res.status(400).json(err('token and password are required'));
   if (password.length < 6) return res.status(400).json(err('Password must be at least 6 characters'));
-  if (!global.inviteTokenStore) return res.status(400).json(err('Invalid or expired invite token'));
-  const stored = global.inviteTokenStore.get(token);
-  if (!stored) return res.status(400).json(err('Invalid or expired invite token'));
-  if (Date.now() > stored.expiresAt) {
-    global.inviteTokenStore.delete(token);
+  const { data: stored, error: tErr } = await supabase
+    .from('invite_tokens').select('*').eq('token', token).maybeSingle();
+  if (tErr || !stored) return res.status(400).json(err('Invalid or expired invite token'));
+  if (Date.now() > stored.expires_at) {
+    await supabase.from('invite_tokens').delete().eq('token', token);
     return res.status(410).json(err('Invite link has expired'));
   }
   const hashed = await hashPassword(password);
-  await supabase.from('users').update({ password: hashed, is_active: true }).eq('id', stored.userId);
-  global.inviteTokenStore.delete(token);
+  await supabase.from('users').update({ password: hashed, is_active: true }).eq('id', stored.user_id);
+  await supabase.from('invite_tokens').delete().eq('token', token);
   console.log(`✅ [INVITE] ${stored.email} activated account`);
   res.json(success(null, 'Password set and account activated'));
 });
