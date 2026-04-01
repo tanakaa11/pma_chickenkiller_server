@@ -1,10 +1,14 @@
 import 'dotenv/config';
+import { resolver, dirname } from 'path';
+import { fileURLToPath } from 'url';
 import express from 'express';
 import cors from 'cors';
 import bcrypt from 'bcrypt';
 import nodemailer from 'nodemailer';
 import { supabase } from './supabase.js';
 
+const __dirname = dirname(fileURLToPath)(import.meta.url));
+dotenv.config({ path: resolve(__dirname, '.env') });
 const app = express();
 const PORT = process.env.PORT || 5000;
 
@@ -497,7 +501,7 @@ app.post('/pma/authentication/register', async (req, res) => {
   }
 
   // Build the verification link (mirrors clean server pattern)
-  const verifyLink = `http://localhost:${PORT}/pma/authentication/verify/${newId}`;
+  const verifyLink = `${process.env.CLIENT_URL}/pma/authentication/verify/${newId}`;
 
   console.log(`📧 [REGISTER] Verify link for ${email}: ${verifyLink}`);
 
