@@ -1,5 +1,5 @@
 import dotenv from 'dotenv';
-import { resolver, dirname } from 'path';
+import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import express from 'express';
 import cors from 'cors';
@@ -30,7 +30,13 @@ if (emailTransporter) {
 }
 
 // Middleware
-app.use(cors());
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: '*',
+  credentials: false,
+}));
+app.options('*', cors());
 app.use(express.json());
 
 // Disable caching for all pma responses
