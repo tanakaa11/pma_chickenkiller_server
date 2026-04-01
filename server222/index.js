@@ -2004,7 +2004,7 @@ app.post('/pma/appointments', async (req, res) => {
     id: newId, patient_id: data.patientId, doctor_id: data.doctorId,
     practice_id: data.practiceId, beneficiary_id: data.beneficiaryId || null,
     date: data.date, start_time: data.startTime, end_time: calculateEnd(data.startTime),
-    status: 'pending_reception', type: 'consultation', notes: data.notes || '',
+    status: 'confirmed', type: 'consultation', notes: data.notes || '',
     created_at: now, updated_at: now,
   });
   const { data: newApt } = await supabase.from('appointments').select(APPOINTMENT_SELECT).eq('id', newId).single();
