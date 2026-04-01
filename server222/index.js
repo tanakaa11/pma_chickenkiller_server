@@ -1,4 +1,4 @@
-import 'dotenv/config';
+import dotenv from 'dotenv';
 import { resolver, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import express from 'express';
@@ -7,7 +7,7 @@ import bcrypt from 'bcrypt';
 import nodemailer from 'nodemailer';
 import { supabase } from './supabase.js';
 
-const __dirname = dirname(fileURLToPath)(import.meta.url));
+const __dirname = dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: resolve(__dirname, '.env') });
 const app = express();
 const PORT = process.env.PORT || 5000;
