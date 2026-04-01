@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
 import bcrypt from 'bcrypt';
@@ -8,8 +9,6 @@ const app = express();
 const PORT = process.env.PORT || 5000;
 
 // Email transporter (Gmail SMTP)
-// Set SMTP_USER and SMTP_APP_PASS env vars to enable email sending.
-// To get an App Password: Google Account → Security → 2-Step Verification → App Passwords
 const emailTransporter = (process.env.SMTP_USER && process.env.SMTP_APP_PASS)
   ? nodemailer.createTransport({
       service: 'gmail',
