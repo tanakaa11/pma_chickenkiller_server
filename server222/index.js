@@ -2453,11 +2453,26 @@ const otpStore = new Map();
 
 app.post('/pma/otp/send', async (req, res) => {
   await delay(500);
-  const { phone, email, appointmentData } = req.body;
+  const { phone, email: emailFromBody, appointmentData } = req.body;
 
-  if (!email) return res.status(400).json(err('Patient email is required to send the verification code'));
   if (!emailTransporter) {
     return res.status(500).json(err('Email service is not configured on the server (SMTP_USER / SMTP_APP_PASS missing)'));
+  }
+
+  // Resolve email: prefer what the frontend sent, otherwise fetch from Supabase by patientId
+  let email = emailFromBody || '';
+  if (!email && appointmentData?.patientId) {
+    const { data: patientRow } = await supabase
+      .from('patients')
+      .select('email')
+      .eq('id', appointmentData.patientId)
+      .maybeSingle();
+    email = patientRow?.email || '';
+    if (email) console.log(`📧 Resolved patient email from DB: ${email}`);
+  }
+
+  if (!email) {
+    return res.status(400).json(err('No email address found for this patient. Please add an email to the patient record before booking.'));
   }
 
   const code = String(Math.floor(100000 + Math.random() * 900000));
@@ -2481,7 +2496,7 @@ app.post('/pma/otp/send', async (req, res) => {
       `,
     });
     console.log(`✅ [EMAIL] OTP sent to ${email}`);
-    res.json(success({ sent: true }, `Verification code sent to ${email}`));
+    res.json(success({ sent: true, email }, `Verification code sent to ${email}`));
   } catch (mailErr) {
     console.error(`❌ [EMAIL] Failed to send OTP to ${email}:`, mailErr.message);
     res.status(500).json(err('Failed to send verification email. Please try again.'));
