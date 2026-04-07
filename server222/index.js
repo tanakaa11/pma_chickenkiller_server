@@ -2454,38 +2454,38 @@ const otpStore = new Map();
 app.post('/pma/otp/send', async (req, res) => {
   await delay(500);
   const { phone, email, appointmentData } = req.body;
-  const key = email || phone;
-  if (!key) return res.status(400).json(err('Email or phone number is required'));
 
-  const code = String(Math.floor(100000 + Math.random() * 900000));
-  otpStore.set(key, { code, expiresAt: Date.now() + 300000, appointmentData });
-  console.log(`📱 OTP for ${key}: ${code}`);
-
-  // Send via SMTP email if transporter is configured and email is provided
-  if (email && emailTransporter) {
-    try {
-      await emailTransporter.sendMail({
-        from: process.env.SMTP_USER,
-        to: email,
-        subject: 'Your Appointment Booking Verification Code',
-        html: `
-          <div style="font-family:sans-serif;max-width:500px;margin:0 auto">
-            <h2 style="color:#1e293b">Appointment Booking Verification</h2>
-            <p>Use the code below to confirm your appointment booking:</p>
-            <div style="background:#f3f4f6;padding:16px 32px;border-radius:8px;text-align:center;margin:24px 0">
-              <span style="font-size:32px;font-family:monospace;letter-spacing:8px;font-weight:bold;color:#2563eb">${code}</span>
-            </div>
-            <p style="color:#6b7280;font-size:14px">This code expires in 5 minutes. Do not share it with anyone.</p>
-          </div>
-        `,
-      });
-      console.log(`✅ [EMAIL] OTP email sent to ${email}`);
-    } catch (mailErr) {
-      console.error(`❌ [EMAIL] Failed to send OTP to ${email}:`, mailErr.message);
-    }
+  if (!email) return res.status(400).json(err('Patient email is required to send the verification code'));
+  if (!emailTransporter) {
+    return res.status(500).json(err('Email service is not configured on the server (SMTP_USER / SMTP_APP_PASS missing)'));
   }
 
-  res.json(success({ sent: true }, `OTP sent to ${email || phone}`));
+  const code = String(Math.floor(100000 + Math.random() * 900000));
+  otpStore.set(email, { code, expiresAt: Date.now() + 300000, appointmentData });
+  console.log(`📧 OTP for ${email}: ${code}`);
+
+  try {
+    await emailTransporter.sendMail({
+      from: `"PMA Health Hub" <${process.env.SMTP_USER}>`,
+      to: email,
+      subject: 'Your Appointment Booking Verification Code',
+      html: `
+        <div style="font-family:sans-serif;max-width:520px;margin:0 auto;color:#1e293b">
+          <h2 style="margin-bottom:8px">Appointment Booking Verification</h2>
+          <p style="color:#64748b">Use the code below to confirm your appointment booking. It expires in <strong>5 minutes</strong>.</p>
+          <div style="background:#f1f5f9;border-radius:10px;padding:24px 0;text-align:center;margin:24px 0">
+            <span style="font-size:36px;font-family:monospace;letter-spacing:10px;font-weight:bold;color:#2563eb">${code}</span>
+          </div>
+          <p style="font-size:13px;color:#94a3b8">Do not share this code with anyone. If you did not request this, please ignore this email.</p>
+        </div>
+      `,
+    });
+    console.log(`✅ [EMAIL] OTP sent to ${email}`);
+    res.json(success({ sent: true }, `Verification code sent to ${email}`));
+  } catch (mailErr) {
+    console.error(`❌ [EMAIL] Failed to send OTP to ${email}:`, mailErr.message);
+    res.status(500).json(err('Failed to send verification email. Please try again.'));
+  }
 });
 
 app.post('/pma/otp/verify', async (req, res) => {
