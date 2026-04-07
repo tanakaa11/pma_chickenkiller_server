@@ -72,7 +72,13 @@ const addPracticeFilter = async (req, res, next) => {
     '/auth/', '/pma/auth/', '/api/auth/',
     '/practices', '/pma/practices', '/api/practices',
     '/users/check-email', '/pma/users/check-email', '/api/users/check-email',
-    '/admin/', '/pma/admin/', '/api/admin/'
+    '/admin/', '/pma/admin/', '/api/admin/',
+    // Patient-mode (guest) public booking endpoints — no auth token required
+    '/pma/otp/',
+    '/pma/doctors',
+    '/pma/schedules/',
+    '/pma/patients/search',
+    '/pma/patients/id-number/',
   ];
   
   // Check if this is a skip path first
@@ -460,11 +466,6 @@ app.post('/auth/logout', async (req, res) => {
 // ============================================================================
 // SELF-REGISTRATION — Clean server flow (register + email verify link)
 //
-//   POST /pma/authentication/register  → creates unverified user, returns verifyLink
-//   GET  /pma/authentication/verify/:userid → activates the user account
-//
-// is_active = false until email verified.
-// Login already filters .eq('is_active', true) so unverified users cannot log in.
 // ============================================================================
 
 app.post('/pma/authentication/register', async (req, res) => {
@@ -2452,28 +2453,93 @@ const otpStore = new Map();
 
 app.post('/pma/otp/send', async (req, res) => {
   await delay(500);
-  console.log(`Sending OTP to phone: ${req.body.phone}`);
-  const { phone } = req.body;
-  if (!phone) return res.status(400).json(err('Phone number is required'));
+  const { phone, email, appointmentData } = req.body;
+  const key = email || phone;
+  if (!key) return res.status(400).json(err('Email or phone number is required'));
+
   const code = String(Math.floor(100000 + Math.random() * 900000));
-  otpStore.set(phone, { code, expiresAt: Date.now() + 300000 });
-  console.log(`📱 OTP for ${phone}: ${code}`);
-  res.json(success({ sent: true }, `OTP sent to ${phone}`));
+  otpStore.set(key, { code, expiresAt: Date.now() + 300000, appointmentData });
+  console.log(`📱 OTP for ${key}: ${code}`);
+
+  // Send via SMTP email if transporter is configured and email is provided
+  if (email && emailTransporter) {
+    try {
+      await emailTransporter.sendMail({
+        from: process.env.SMTP_USER,
+        to: email,
+        subject: 'Your Appointment Booking Verification Code',
+        html: `
+          <div style="font-family:sans-serif;max-width:500px;margin:0 auto">
+            <h2 style="color:#1e293b">Appointment Booking Verification</h2>
+            <p>Use the code below to confirm your appointment booking:</p>
+            <div style="background:#f3f4f6;padding:16px 32px;border-radius:8px;text-align:center;margin:24px 0">
+              <span style="font-size:32px;font-family:monospace;letter-spacing:8px;font-weight:bold;color:#2563eb">${code}</span>
+            </div>
+            <p style="color:#6b7280;font-size:14px">This code expires in 5 minutes. Do not share it with anyone.</p>
+          </div>
+        `,
+      });
+      console.log(`✅ [EMAIL] OTP email sent to ${email}`);
+    } catch (mailErr) {
+      console.error(`❌ [EMAIL] Failed to send OTP to ${email}:`, mailErr.message);
+    }
+  }
+
+  res.json(success({ sent: true }, `OTP sent to ${email || phone}`));
 });
 
 app.post('/pma/otp/verify', async (req, res) => {
   await delay(300);
-  console.log(`Verifying OTP for phone: ${req.body.phone} with code: ${req.body.code}`);
-  const { phone, code } = req.body;
-  if (!phone || !code) return res.status(400).json(err('Phone and code are required'));
-  const stored = otpStore.get(phone);
-  if (!stored) return res.status(400).json(err('No OTP was sent to this number'));
+  const { phone, email, code } = req.body;
+  const key = email || phone;
+  if (!key || !code) return res.status(400).json(err('Email/phone and code are required'));
+
+  const stored = otpStore.get(key);
+  if (!stored) return res.status(400).json(err('No OTP was sent to this address'));
   if (Date.now() > stored.expiresAt) {
-    otpStore.delete(phone);
+    otpStore.delete(key);
     return res.status(400).json(err('OTP has expired'));
   }
   if (stored.code === code || code === '000000') {
-    otpStore.delete(phone);
+    const { appointmentData } = stored;
+    otpStore.delete(key);
+
+    // Create the appointment server-side after verification
+    if (appointmentData) {
+      try {
+        const data = appointmentData;
+        const { data: conflict } = await supabase.from('appointments').select('id')
+          .eq('doctor_id', data.doctorId).eq('date', data.date).eq('start_time', data.startTime)
+          .not('status', 'in', '("cancelled","rejected")').maybeSingle();
+        if (conflict) return res.status(400).json(err('This time slot is already booked'));
+
+        const { data: patientDayConflict } = await supabase.from('appointments').select('id')
+          .eq('patient_id', data.patientId).eq('date', data.date)
+          .not('status', 'in', '("cancelled","rejected")').maybeSingle();
+        if (patientDayConflict) return res.status(400).json(err('This patient already has an appointment booked for this date.'));
+
+        const calculateEnd = (s) => {
+          const [h, m] = s.split(':').map(Number);
+          const em = m + 30;
+          return `${String(h + Math.floor(em / 60)).padStart(2, '0')}:${String(em % 60).padStart(2, '0')}`;
+        };
+        const newId = `appointment-${Date.now()}`;
+        const now = new Date().toISOString();
+        await supabase.from('appointments').insert({
+          id: newId, patient_id: data.patientId, doctor_id: data.doctorId,
+          practice_id: data.practiceId || null, beneficiary_id: data.beneficiaryId || null,
+          date: data.date, start_time: data.startTime, end_time: calculateEnd(data.startTime),
+          status: 'confirmed', type: 'consultation', notes: data.notes || '',
+          created_at: now, updated_at: now,
+        });
+        console.log(`✅ Appointment ${newId} created after OTP verification for key=${key}`);
+        return res.json(success({ verified: true }, 'OTP verified and appointment booked'));
+      } catch (dbErr) {
+        console.error('Appointment creation error after OTP verify:', dbErr);
+        return res.status(500).json(err('OTP verified but appointment creation failed'));
+      }
+    }
+
     return res.json(success({ verified: true }, 'OTP verified'));
   }
   return res.status(400).json(err('Invalid OTP'));
