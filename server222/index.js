@@ -2476,7 +2476,9 @@ app.post('/pma/otp/send', async (req, res) => {
   }
 
   const code = String(Math.floor(100000 + Math.random() * 900000));
-  otpStore.set(email, { code, expiresAt: Date.now() + 300000, appointmentData });
+  const otpEntry = { code, expiresAt: Date.now() + 300000, appointmentData, resolvedEmail: email };
+  otpStore.set(email, otpEntry);               // primary key: email
+  if (phone) otpStore.set(phone, otpEntry);    // fallback key: phone (for old clients)
   console.log(`📧 OTP for ${email}: ${code}`);
 
   try {
@@ -2506,18 +2508,40 @@ app.post('/pma/otp/send', async (req, res) => {
 app.post('/pma/otp/verify', async (req, res) => {
   await delay(300);
   const { phone, email, code } = req.body;
-  const key = email || phone;
-  if (!key || !code) return res.status(400).json(err('Email/phone and code are required'));
+  if (!code) return res.status(400).json(err('Verification code is required'));
 
-  const stored = otpStore.get(key);
-  if (!stored) return res.status(400).json(err('No OTP was sent to this address'));
+  // Look up by email first, then phone, then scan store for a phone match
+  let key = null;
+  let stored = null;
+  if (email) {
+    const entry = otpStore.get(email);
+    if (entry) { key = email; stored = entry; }
+  }
+  if (!stored && phone) {
+    const entry = otpStore.get(phone);
+    if (entry) { key = phone; stored = entry; }
+  }
+  // Last resort: scan store for any entry whose resolvedEmail or phone matches
+  if (!stored) {
+    for (const [k, v] of otpStore.entries()) {
+      if ((email && v.resolvedEmail === email) || (phone && k === phone)) {
+        key = k; stored = v; break;
+      }
+    }
+  }
+
+  if (!stored) return res.status(400).json(err('No OTP was sent to this address. Please request a new code.'));
   if (Date.now() > stored.expiresAt) {
     otpStore.delete(key);
+    if (stored.resolvedEmail) otpStore.delete(stored.resolvedEmail);
+    if (phone) otpStore.delete(phone);
     return res.status(400).json(err('OTP has expired'));
   }
   if (stored.code === code || code === '000000') {
     const { appointmentData } = stored;
     otpStore.delete(key);
+    if (stored.resolvedEmail) otpStore.delete(stored.resolvedEmail);
+    if (phone) otpStore.delete(phone);
 
     // Create the appointment server-side after verification
     if (appointmentData) {
@@ -2591,6 +2615,49 @@ app.use((error, req, res, next) => {
   console.error('Server error:', error);
   res.status(500).json(err('Internal server error'));
 });
+
+// ============================================================================
+// HUGGING FACE PROXY — avoids browser CORS restrictions
+// ============================================================================
+
+app.post('/api/ai/summarise', async (req, res) => {
+  const apiKey = process.env.HUGGINGFACE_API_KEY;
+  if (!apiKey) {
+    return res.status(500).json(error('HUGGINGFACE_API_KEY is not set on the server.'));
+  }
+
+  const { inputs } = req.body;
+  if (!inputs || typeof inputs !== 'string') {
+    return res.status(400).json(error('Missing or invalid "inputs" field.'));
+  }
+
+  try {
+    const hfRes = await fetch(
+      'https://api-inference.huggingface.co/models/facebook/bart-large-cnn',
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ inputs }),
+      }
+    );
+
+    const data = await hfRes.json();
+
+    if (!hfRes.ok) {
+      return res.status(hfRes.status).json(error(data?.error ?? 'HF API error'));
+    }
+
+    res.json(data);
+  } catch (err) {
+    console.error('HF proxy error:', err);
+    res.status(502).json(error('Failed to reach Hugging Face API.'));
+  }
+});
+
+
 
 // ============================================================================
 // START SERVER
