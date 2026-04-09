@@ -2607,6 +2607,10 @@ app.post('/pma/auth/update-password', async (req, res) => {
 // HUGGING FACE PROXY — avoids browser CORS restrictions
 // ============================================================================
 
+// In-memory cache: key = trimmed input, value = { data, expiresAt }
+const summaryCache = new Map();
+const SUMMARY_CACHE_TTL = 2 * 60 * 1000; // 2 minutes
+
 app.post('/pma/ai/summarise', async (req, res) => {
   const apiKey = process.env.HUGGINGFACE_API_KEY;
   if (!apiKey) {
@@ -2616,6 +2620,14 @@ app.post('/pma/ai/summarise', async (req, res) => {
   const { inputs } = req.body;
   if (!inputs || typeof inputs !== 'string') {
     return res.status(400).json(err('Missing or invalid "inputs" field.'));
+  }
+
+  // Cache lookup
+  const cacheKey = inputs.trim();
+  const cached = summaryCache.get(cacheKey);
+  if (cached && Date.now() < cached.expiresAt) {
+    console.log('[AI] Returning cached summary');
+    return res.json(cached.data);
   }
 
   const HF_URL = 'https://router.huggingface.co/hf-inference/models/facebook/bart-large-cnn';
@@ -2631,7 +2643,10 @@ app.post('/pma/ai/summarise', async (req, res) => {
         Authorization: `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({ inputs }),
+      body: JSON.stringify({
+        inputs,
+        parameters: { max_length: 120, min_length: 20, do_sample: false },
+      }),
       signal: controller.signal,
     });
 
@@ -2648,6 +2663,10 @@ app.post('/pma/ai/summarise', async (req, res) => {
       }
       return res.status(hfRes.status).json(err(data?.error ?? `HF API error ${hfRes.status}`));
     }
+
+    // Store in cache, auto-expire after TTL
+    summaryCache.set(cacheKey, { data, expiresAt: Date.now() + SUMMARY_CACHE_TTL });
+    setTimeout(() => summaryCache.delete(cacheKey), SUMMARY_CACHE_TTL);
 
     res.json(data);
   } catch (e) {
