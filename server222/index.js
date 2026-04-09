@@ -2618,42 +2618,46 @@ app.post('/pma/ai/summarise', async (req, res) => {
     return res.status(400).json(err('Missing or invalid "inputs" field.'));
   }
 
+  const HF_URL = 'https://router.huggingface.co/hf-inference/models/facebook/bart-large-cnn';
+  console.log(`[AI] Calling HF router: ${HF_URL}`);
+
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 25000); // 25s max
+  const timeout = setTimeout(() => controller.abort(), 30000); // 30s max
 
   try {
-    const hfRes = await fetch(
-      'https://router.huggingface.co/models/facebook/bart-large-cnn',
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ inputs, options: { wait_for_model: true } }),
-        signal: controller.signal,
-      }
-    );
+    const hfRes = await fetch(HF_URL, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ inputs }),
+      signal: controller.signal,
+    });
 
     clearTimeout(timeout);
-    const data = await hfRes.json();
+    const rawText = await hfRes.text();
+    console.log(`[AI] HF status: ${hfRes.status}, body: ${rawText.slice(0, 300)}`);
+
+    let data;
+    try { data = JSON.parse(rawText); } catch { data = { error: rawText }; }
 
     if (!hfRes.ok) {
       if (hfRes.status === 503) {
         return res.status(503).json(err('The AI model is warming up, please try again in a few seconds.'));
       }
-      return res.status(hfRes.status).json(err(data?.error ?? 'HF API error'));
+      return res.status(hfRes.status).json(err(data?.error ?? `HF API error ${hfRes.status}`));
     }
 
     res.json(data);
   } catch (e) {
     clearTimeout(timeout);
     if (e.name === 'AbortError') {
-      console.error('HF proxy timeout');
+      console.error('[AI] HF proxy timeout');
       return res.status(504).json(err('AI request timed out. The model may be loading — please try again.'));
     }
-    console.error('HF proxy error:', e);
-    res.status(502).json(err('Failed to reach Hugging Face API.'));
+    console.error('[AI] HF proxy error:', e.message);
+    res.status(502).json(err(`Failed to reach Hugging Face API: ${e.message}`));
   }
 });
 
