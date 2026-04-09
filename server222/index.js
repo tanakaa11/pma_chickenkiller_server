@@ -2631,6 +2631,9 @@ app.post('/pma/ai/summarise', async (req, res) => {
     return res.status(400).json(error('Missing or invalid "inputs" field.'));
   }
 
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 25000); // 25s max
+
   try {
     const hfRes = await fetch(
       'https://api-inference.huggingface.co/models/facebook/bart-large-cnn',
@@ -2640,18 +2643,29 @@ app.post('/pma/ai/summarise', async (req, res) => {
           Authorization: `Bearer ${apiKey}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({ inputs }),
+        body: JSON.stringify({ inputs, options: { wait_for_model: true } }),
+        signal: controller.signal,
       }
     );
 
+    clearTimeout(timeout);
     const data = await hfRes.json();
 
     if (!hfRes.ok) {
+      // 503 means the model is still loading — surface a friendly message
+      if (hfRes.status === 503) {
+        return res.status(503).json(error('The AI model is warming up, please try again in a few seconds.'));
+      }
       return res.status(hfRes.status).json(error(data?.error ?? 'HF API error'));
     }
 
     res.json(data);
   } catch (err) {
+    clearTimeout(timeout);
+    if (err.name === 'AbortError') {
+      console.error('HF proxy timeout');
+      return res.status(504).json(error('AI request timed out. The model may be loading — please try again.'));
+    }
     console.error('HF proxy error:', err);
     res.status(502).json(error('Failed to reach Hugging Face API.'));
   }
