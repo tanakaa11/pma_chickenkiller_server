@@ -2622,7 +2622,7 @@ app.post('/pma/ai/summarise', async (req, res) => {
   console.log(`[AI] Calling HF router: ${HF_URL}`);
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 30000); // 30s max
+  const timeout = setTimeout(() => controller.abort(), 60000); // 60s — model can be slow to cold-start
 
   try {
     const hfRes = await fetch(HF_URL, {
