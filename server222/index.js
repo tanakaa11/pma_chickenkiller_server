@@ -2610,12 +2610,12 @@ app.post('/pma/auth/update-password', async (req, res) => {
 app.post('/pma/ai/summarise', async (req, res) => {
   const apiKey = process.env.HUGGINGFACE_API_KEY;
   if (!apiKey) {
-    return res.status(500).json(error('HUGGINGFACE_API_KEY is not set on the server.'));
+    return res.status(500).json(err('HUGGINGFACE_API_KEY is not set on the server.'));
   }
 
   const { inputs } = req.body;
   if (!inputs || typeof inputs !== 'string') {
-    return res.status(400).json(error('Missing or invalid "inputs" field.'));
+    return res.status(400).json(err('Missing or invalid "inputs" field.'));
   }
 
   const controller = new AbortController();
@@ -2639,22 +2639,21 @@ app.post('/pma/ai/summarise', async (req, res) => {
     const data = await hfRes.json();
 
     if (!hfRes.ok) {
-      // 503 means the model is still loading — surface a friendly message
       if (hfRes.status === 503) {
-        return res.status(503).json(error('The AI model is warming up, please try again in a few seconds.'));
+        return res.status(503).json(err('The AI model is warming up, please try again in a few seconds.'));
       }
-      return res.status(hfRes.status).json(error(data?.error ?? 'HF API error'));
+      return res.status(hfRes.status).json(err(data?.error ?? 'HF API error'));
     }
 
     res.json(data);
-  } catch (err) {
+  } catch (e) {
     clearTimeout(timeout);
-    if (err.name === 'AbortError') {
+    if (e.name === 'AbortError') {
       console.error('HF proxy timeout');
-      return res.status(504).json(error('AI request timed out. The model may be loading — please try again.'));
+      return res.status(504).json(err('AI request timed out. The model may be loading — please try again.'));
     }
-    console.error('HF proxy error:', err);
-    res.status(502).json(error('Failed to reach Hugging Face API.'));
+    console.error('HF proxy error:', e);
+    res.status(502).json(err('Failed to reach Hugging Face API.'));
   }
 });
 
