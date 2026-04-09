@@ -2620,7 +2620,7 @@ app.use((error, req, res, next) => {
 // HUGGING FACE PROXY — avoids browser CORS restrictions
 // ============================================================================
 
-app.post('/api/ai/summarise', async (req, res) => {
+app.post('/pma/ai/summarise', async (req, res) => {
   const apiKey = process.env.HUGGINGFACE_API_KEY;
   if (!apiKey) {
     return res.status(500).json(error('HUGGINGFACE_API_KEY is not set on the server.'));
