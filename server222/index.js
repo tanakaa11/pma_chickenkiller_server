@@ -2623,7 +2623,7 @@ app.post('/pma/ai/summarise', async (req, res) => {
 
   try {
     const hfRes = await fetch(
-      'https://api-inference.huggingface.co/models/facebook/bart-large-cnn',
+      'https://router.huggingface.co/models/facebook/bart-large-cnn',
       {
         method: 'POST',
         headers: {
