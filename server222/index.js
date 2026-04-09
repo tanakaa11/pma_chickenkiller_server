@@ -2604,19 +2604,6 @@ app.post('/pma/auth/update-password', async (req, res) => {
 });
 
 // ============================================================================
-// ERROR HANDLING
-// ============================================================================
-
-app.use((req, res) => {
-  res.status(404).json(err('Endpoint not found'));
-});
-
-app.use((error, req, res, next) => {
-  console.error('Server error:', error);
-  res.status(500).json(err('Internal server error'));
-});
-
-// ============================================================================
 // HUGGING FACE PROXY — avoids browser CORS restrictions
 // ============================================================================
 
@@ -2669,6 +2656,19 @@ app.post('/pma/ai/summarise', async (req, res) => {
     console.error('HF proxy error:', err);
     res.status(502).json(error('Failed to reach Hugging Face API.'));
   }
+});
+
+// ============================================================================
+// ERROR HANDLING
+// ============================================================================
+
+app.use((req, res) => {
+  res.status(404).json(err('Endpoint not found'));
+});
+
+app.use((error, req, res, next) => {
+  console.error('Server error:', error);
+  res.status(500).json(err('Internal server error'));
 });
 
 
