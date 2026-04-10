@@ -1,16 +1,294 @@
-import dotenv from 'dotenv';
+﻿import dotenv from 'dotenv';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import express from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
 import bcrypt from 'bcrypt';
 import nodemailer from 'nodemailer';
 import { supabase } from './supabase.js';
+import rateLimit from 'express-rate-limit';
+import { z } from 'zod';
+import jwt from 'jsonwebtoken';
+import { randomUUID, createHash } from 'crypto';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: resolve(__dirname, '.env') });
+
+// ============================================================================
+// STARTUP — warn about missing optional env vars
+// ============================================================================
+if (!process.env.JWT_SECRET) console.warn('⚠️  JWT_SECRET not set in .env — using insecure dev fallback');
+if (!process.env.CLIENT_URL) console.warn('⚠️  CLIENT_URL not set — invite/verification links will use default');
+if (!process.env.SMTP_USER || !process.env.SMTP_APP_PASS) console.warn('⚠️  SMTP credentials not set — email sending disabled');
 const app = express();
 const PORT = process.env.PORT || 5000;
+
+// --- Rate limiters ---
+// Protects auth endpoints from brute-force attacks (10 attempts / 15 min per IP)
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many attempts. Please try again in 15 minutes.' },
+});
+// OTP send triggers an email — tightest limit (5 / 60 min per IP)
+const otpSendLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many OTP requests. Please try again in 1 hour.' },
+});
+// OTP verify — prevent code brute-forcing (10 / 15 min per IP)
+const otpVerifyLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { success: false, message: 'Too many verification attempts. Please try again in 15 minutes.' },
+});
+
+// ============================================================================
+// JWT AUTHENTICATION UTILITIES
+// ============================================================================
+const JWT_SECRET = process.env.JWT_SECRET || (() => {
+  console.warn('⚠️  JWT_SECRET not set — using insecure dev fallback. Set JWT_SECRET in .env for production.');
+  return 'pma-dev-secret-change-in-production';
+})();
+const JWT_EXPIRY = '15m';
+const REFRESH_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
+const hashToken = (t) => createHash('sha256').update(t).digest('hex');
+const signToken = (payload) => jwt.sign(payload, JWT_SECRET, { expiresIn: JWT_EXPIRY });
+const verifyToken = (token) => {
+  try { return jwt.verify(token, JWT_SECRET); }
+  catch { return null; }
+};
+
+// ============================================================================
+// INPUT VALIDATION SCHEMAS (zod)
+// ============================================================================
+
+const email  = z.string().trim().email().toLowerCase().max(254);
+const name   = z.string().trim().min(1).max(100);
+const pwd    = z.string().min(6).max(100);
+const roleId = z.enum(['ROLE_SYSADMIN', 'ROLE_ADMIN', 'ROLE_PRACTITIONER']);
+const uiRole = z.enum(['super_admin', 'doctor', 'reception', 'unlinked']);
+const isoDate = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Expected YYYY-MM-DD');
+const timeStr = z.string().regex(/^\d{2}:\d{2}$/, 'Expected HH:MM');
+
+const loginSchema = z.object({
+  email,
+  password: pwd,
+});
+
+const selfRegisterSchema = z.object({
+  email,
+  password: pwd,
+  firstname: name,
+  lastname:  name,
+});
+
+const adminRegisterSchema = z.object({
+  email,
+  password:    pwd,
+  firstName:   name,
+  lastName:    name,
+  roleId,
+  practiceIds: z.array(z.string()).optional(),
+});
+
+const setPasswordSchema = z.object({
+  token:    z.string().min(1).max(500),
+  password: pwd,
+});
+
+const updatePasswordSchema = z.object({
+  email:       email,
+  newPassword: pwd,
+});
+
+const createUserSchema = z.object({
+  email,
+  firstName: name,
+  lastName:  name,
+  role:      uiRole.optional(),
+});
+
+const updateUserSchema = z.object({
+  email:     email.optional(),
+  firstName: name.optional(),
+  lastName:  name.optional(),
+  isActive:  z.boolean().optional(),
+  role:      uiRole.optional(),
+});
+
+const linkPracticeSchema = z.object({
+  practiceId: z.string().min(1).max(100),
+  roleId:     roleId.optional(),
+  force:      z.boolean().optional(),
+});
+
+const adminLinkSchema = z.object({
+  email,
+  practiceId: z.string().min(1).max(100),
+  roleId,
+  firstName:  name.optional(),
+  lastName:   name.optional(),
+  force:      z.boolean().optional(),
+});
+
+const sendInviteEmailSchema = z.object({
+  email,
+  inviteLink:   z.string().url(),
+  practiceName: z.string().max(200).optional(),
+  firstName:    name.optional(),
+});
+
+const sendOtpAdminSchema = z.object({
+  userId:     z.string().min(1).max(100),
+  practiceId: z.string().min(1).max(100),
+});
+
+const createAndInviteSchema = z.object({
+  email,
+  firstName:    name,
+  lastName:     name,
+  roleId,
+  practiceId:   z.string().min(1).max(100),
+  tempPassword: pwd.optional(),
+});
+
+const verifyPracticeOtpSchema = z.object({
+  otp:    z.string().length(6).regex(/^\d+$/),
+  userId: z.string().min(1).max(100),
+});
+
+const patientAddressSchema = z.object({
+  street:     z.string().max(200).optional(),
+  city:       z.string().max(100).optional(),
+  province:   z.string().max(100).optional(),
+  postalCode: z.string().max(20).optional(),
+  postal_code: z.string().max(20).optional(),
+}).optional();
+
+const emergencyContactSchema = z.object({
+  name:         z.string().max(100).optional(),
+  relationship: z.string().max(50).optional(),
+  phone:        z.string().max(30).optional(),
+}).optional();
+
+const createPatientSchema = z.object({
+  firstName:   name,
+  lastName:    name,
+  dateOfBirth: isoDate.optional(),
+  gender:      z.string().max(20).optional(),
+  idNumber:    z.string().max(20).optional(),
+  phone:       z.string().max(30).optional(),
+  email:       email.optional().or(z.literal('')),
+  practiceId:  z.string().max(100).optional(),
+  allergies:   z.array(z.string()).optional(),
+  address:     patientAddressSchema,
+  emergencyContact: emergencyContactSchema,
+  medicalAids: z.any().optional(),
+});
+
+const updatePatientSchema = createPatientSchema.partial();
+
+const createAppointmentSchema = z.object({
+  patientId:    z.string().min(1).max(100),
+  doctorId:     z.string().min(1).max(100),
+  practiceId:   z.string().max(100).optional(),
+  beneficiaryId: z.string().max(100).optional(),
+  date:         isoDate,
+  startTime:    timeStr,
+  notes:        z.string().max(2000).optional(),
+});
+
+const patchAppointmentSchema = z.object({
+  status:    z.string().max(50).optional(),
+  notes:     z.string().max(2000).optional(),
+  date:      isoDate.optional(),
+  startTime: timeStr.optional(),
+  endTime:   timeStr.optional(),
+});
+
+const otpSendSchema = z.object({
+  phone:           z.string().max(30).optional(),
+  email:           email.optional().or(z.literal('')),
+  appointmentData: z.any().optional(),
+});
+
+const otpVerifySchema = z.object({
+  phone: z.string().max(30).optional(),
+  email: email.optional().or(z.literal('')),
+  code:  z.string().length(6).regex(/^\d+$/),
+});
+
+const createVisitSchema = z.object({
+  appointmentId:          z.string().max(100).optional(),
+  patientId:              z.string().min(1).max(100),
+  doctorId:               z.string().min(1).max(100),
+  practicePractitionerId: z.string().max(100).optional(),
+  reasonForVisit:         z.string().max(2000).optional(),
+  consultationNotes:      z.string().max(10000).optional(),
+  vitals:                 z.any().optional(),
+  diagnoses:              z.array(z.any()).optional(),
+  procedures:             z.array(z.any()).optional(),
+  prescriptions:          z.array(z.any()).optional(),
+  clinicalDocuments:      z.array(z.any()).optional(),
+});
+
+const updateVisitSchema = createVisitSchema.partial();
+
+// Helper: parse & reject with 400 on failure
+const validate = (schema, req, res) => {
+  const result = schema.safeParse(req.body);
+  if (!result.success) {
+    const message = result.error.issues.map(i => `${i.path.join('.')}: ${i.message}`).join('; ');
+    res.status(400).json({ success: false, message: `Invalid input: ${message}` });
+    return null;
+  }
+  return result.data;
+};
+
+// ============================================================================
+// PRODUCTION UTILITIES
+// ============================================================================
+
+// Abort a DB call that takes longer than `ms` milliseconds
+const withTimeout = (promise, ms = 8000) =>
+  Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error('Database request timed out')), ms)
+    ),
+  ]);
+
+// Strip characters that break PostgREST's .or() filter syntax
+const sanitizeSearch = (s) => String(s || '').replace(/[%,()\\]/g, '').slice(0, 100);
+
+// Fire-and-forget email: resolves immediately, logs errors in background
+const sendMailAsync = (opts, label = 'email') => {
+  if (!emailTransporter) return;
+  emailTransporter.sendMail(opts)
+    .then(() => console.log(`✅ [EMAIL] ${label} sent to ${opts.to}`))
+    .catch(e  => console.error(`❌ [EMAIL] Failed to send ${label} to ${opts.to}:`, e.message));
+};
+
+// POPIA audit log — fire-and-forget insert into audit_logs table
+const logAudit = (req, action, resourceId) => {
+  supabase.from('audit_logs').insert({
+    user_id:     req.userContext?.userId || null,
+    action,
+    resource_id: String(resourceId),
+    ip_address:  req.ip || req.socket?.remoteAddress || null,
+    created_at:  new Date().toISOString(),
+  }).then(({ error }) => {
+    if (error) console.error('[AUDIT] Failed to log:', action, resourceId, error.message);
+  });
+};
 
 // Email transporter (Gmail SMTP)
 const emailTransporter = (process.env.SMTP_USER && process.env.SMTP_APP_PASS)
@@ -30,6 +308,9 @@ if (emailTransporter) {
 }
 
 // Middleware
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'cross-origin' }, // allow cross-origin fetches from the SPA
+}));
 app.use(cors({
   origin: '*',
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
@@ -56,18 +337,10 @@ app.use((req, res, next) => {
   next();
 });
 
-// Practice filtering middleware - ensures users only see their practice's data
-const extractUserIdFromToken = (req) => {
-  const authHeader = req.headers.authorization;
-  if (!authHeader || !authHeader.startsWith('Bearer ')) return null;
-  const token = authHeader.replace('Bearer ', '');
-  // Extract user ID from mock token format: "mock-jwt-token-{userId}"
-  const match = token.match(/mock-jwt-token-(.+)/);
-  return match ? match[1] : null;
-};
-
+// Practice filtering middleware — reads practiceIds/role/flags from JWT payload;
+// eliminates all per-request DB round-trips in the common path.
 const addPracticeFilter = async (req, res, next) => {
-  // Skip for auth routes, public routes, user profile endpoints, and admin functions
+  // Skip for auth routes, public routes, and admin functions
   const skipPaths = [
     '/auth/', '/pma/auth/', '/api/auth/',
     '/practices', '/pma/practices', '/api/practices',
@@ -80,118 +353,66 @@ const addPracticeFilter = async (req, res, next) => {
     '/pma/patients/search',
     '/pma/patients/id-number/',
   ];
-  
-  // Check if this is a skip path first
+
   if (skipPaths.some(path => req.path.startsWith(path))) {
     return next();
   }
-  
-  // Extract userId from token
-  const userId = extractUserIdFromToken(req);
-  
-  if (!userId) {
+
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) {
     return res.status(401).json(err('Authentication required'));
   }
-  
-  // Skip user's own profile and practice checking endpoints
+
+  const payload = verifyToken(authHeader.replace('Bearer ', ''));
+  if (!payload) {
+    return res.status(401).json(err('Invalid or expired token. Please log in again.'));
+  }
+
+  const { userId, role, practiceIds: tokenPracticeIds = [], isSuperAdmin, isSuperSuperAdmin } = payload;
+
+  // Skip practice-scope check for user's own profile endpoints
   const userProfilePaths = [
     `/users/${userId}/my-practice`, `/pma/users/${userId}/my-practice`, `/api/users/${userId}/my-practice`,
     `/users/${userId}/my-practices`, `/pma/users/${userId}/my-practices`, `/api/users/${userId}/my-practices`,
-    `/users/${userId}`, `/pma/users/${userId}`, `/api/users/${userId}`
+    `/users/${userId}`, `/pma/users/${userId}`, `/api/users/${userId}`,
   ];
-  
   if (userProfilePaths.some(path => req.path === path)) {
+    req.userContext = { userId, practiceId: null, isSuperAdmin, isSuperSuperAdmin };
     return next();
   }
 
-  // Check user's role from DB for super_super_admin bypass
-  const { data: userRow } = await supabase
-    .from('users').select('role').eq('id', userId).maybeSingle();
-
-  if (userRow?.role === 'super_super_admin') {
-    // Super super admin bypasses all practice filtering
-    // They can optionally send X-Practice-Id to scope to a specific practice
+  if (isSuperSuperAdmin) {
     const headerPracticeId = req.headers['x-practice-id'] || null;
-    req.userContext = {
-      userId,
-      practiceId: headerPracticeId,
-      isSuperAdmin: true,
-      isSuperSuperAdmin: true,
-    };
+    req.userContext = { userId, practiceId: headerPracticeId, isSuperAdmin: true, isSuperSuperAdmin: true };
     return next();
   }
 
-  // Check for X-Practice-Id header (multi-practice support)
-  const headerPracticeId = req.headers['x-practice-id'] || null;
-
-  // Get ALL user's linked practices
-  const { data: allUserPractices } = await supabase
-    .from('user_practices')
-    .select('practice_id')
-    .eq('user_id', userId);
-
-  const linkedPracticeIds = new Set((allUserPractices || []).map(p => p.practice_id));
-
-  // Also check user_roles and practice_practitioners as fallback
-  if (linkedPracticeIds.size === 0) {
-    const [{ data: roleRows }, { data: ppRows }] = await Promise.all([
-      supabase.from('user_roles').select('practice_id').eq('user_id', userId).not('practice_id', 'is', null),
-      supabase.from('practice_practitioners').select('practice_id').eq('user_id', userId),
-    ]);
-    for (const r of (roleRows || [])) linkedPracticeIds.add(r.practice_id);
-    for (const p of (ppRows || []))   linkedPracticeIds.add(p.practice_id);
-
-    // Back-fill user_practices for fast future lookups
-    if (linkedPracticeIds.size > 0) {
-      const { data: practiceNames } = await supabase
-        .from('practices').select('id, name').in('id', [...linkedPracticeIds]);
-      const nameMap = Object.fromEntries((practiceNames || []).map(p => [p.id, p.name]));
-      const inserts = [...linkedPracticeIds].map(pid => ({
-        user_id: userId, practice_id: pid, practice_name: nameMap[pid] || '',
-      }));
-      await supabase.from('user_practices').upsert(inserts, { onConflict: 'user_id,practice_id' }).select();
-    }
-  }
-
-  // Determine which practice to scope to
-  let practiceId = null;
-
-  if (headerPracticeId && linkedPracticeIds.has(headerPracticeId)) {
-    // Frontend explicitly requested this practice and user is linked
-    practiceId = headerPracticeId;
-  } else if (linkedPracticeIds.size > 0) {
-    // Default to first linked practice
-    practiceId = [...linkedPracticeIds][0];
-  }
+  const linkedPracticeIds = new Set(tokenPracticeIds);
+  const headerPracticeId  = req.headers['x-practice-id'] || null;
+  const practiceId = (headerPracticeId && linkedPracticeIds.has(headerPracticeId))
+    ? headerPracticeId
+    : (linkedPracticeIds.size > 0 ? [...linkedPracticeIds][0] : null);
 
   if (!practiceId) {
     return res.status(403).json(err('User is not linked to any practice'));
   }
 
-  // Check if user is super admin (can access all data)
-  const { data: userRoles } = await supabase
-    .from('user_roles')
-    .select('role_id')
-    .eq('user_id', userId);
-
-  const isSuperAdmin = userRoles?.some(role => role.role_id === 'ROLE_SYSADMIN');
-  
-  // Attach practice info to request for use in endpoints
   req.userContext = {
     userId,
     practiceId,
-    isSuperAdmin,
+    isSuperAdmin: isSuperAdmin || false,
     isSuperSuperAdmin: false,
     linkedPracticeIds: [...linkedPracticeIds],
   };
-
   next();
 };
 
-app.use(addPracticeFilter);
+// Health check — called by load balancers, Docker, Railway, Render, etc.
+app.get('/health', (req, res) => {
+  res.json({ status: 'ok', timestamp: new Date().toISOString() });
+});
 
-// Helper to simulate network delay
-const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+app.use(addPracticeFilter);
 
 // Helper to send success response
 const success = (data, message) => ({ success: true, data, message });
@@ -379,6 +600,28 @@ const enrichVisit = async (visit) => {
   };
 };
 
+// Batch variant: 3 total DB queries for N visits (instead of N×3)
+const enrichVisitsBatch = async (formattedVisits) => {
+  if (!formattedVisits?.length) return [];
+  const patientIds = [...new Set(formattedVisits.map(v => v.patientId).filter(Boolean))];
+  const doctorIds  = [...new Set(formattedVisits.map(v => v.doctorId).filter(Boolean))];
+  const visitIds   = formattedVisits.map(v => v.id).filter(Boolean);
+  const [{ data: patients }, { data: doctors }, { data: invoices }] = await Promise.all([
+    patientIds.length ? supabase.from('patients').select(PATIENT_SELECT).in('id', patientIds) : { data: [] },
+    doctorIds.length  ? supabase.from('doctors').select('*').in('id', doctorIds)              : { data: [] },
+    visitIds.length   ? supabase.from('invoices').select(INVOICE_SELECT).in('visit_id', visitIds) : { data: [] },
+  ]);
+  const patientMap = Object.fromEntries((patients || []).map(p => [p.id, p]));
+  const doctorMap  = Object.fromEntries((doctors  || []).map(d => [d.id, d]));
+  const invoiceMap = Object.fromEntries((invoices || []).map(i => [i.visit_id, i]));
+  return formattedVisits.map(v => ({
+    ...v,
+    patient: patientMap[v.patientId] ? formatPatient(patientMap[v.patientId]) : undefined,
+    doctor:  doctorMap[v.doctorId]   ? toCamel(doctorMap[v.doctorId])          : undefined,
+    invoice: invoiceMap[v.id]        ? formatInvoice(invoiceMap[v.id])          : undefined,
+  }));
+};
+
 // ============================================================================
 // AUTH ENDPOINTS — LOGIN
 // ============================================================================
@@ -397,14 +640,12 @@ app.get('/auth/login', (req, res) => {
 });
 
 const loginHandler = async (req, res) => {
-  await delay(300);
-  const { email, password } = req.body;
+  const data = validate(loginSchema, req, res);
+  if (!data) return;
+  const { email, password } = data;
 
   console.log(`🔍 [LOGIN] Attempting login for: ${email}`);
 
-  if (!email || !password) {
-    return res.status(400).json(err('Email and password are required'));
-  }
 
   // Only allow active (verified) users to log in
   const { data: u, error: dbErr } = await supabase
@@ -435,13 +676,9 @@ const loginHandler = async (req, res) => {
   if (u.password.startsWith('$2b$')) {
     passwordValid = await verifyPassword(password, u.password);
   } else {
-    // Plaintext fallback — upgrade to hashed on successful login
-    passwordValid = (password === u.password);
-    if (passwordValid) {
-      const hashed = await hashPassword(password);
-      await supabase.from('users').update({ password: hashed }).eq('id', u.id);
-      console.log(`🔍 [LOGIN] Upgraded plaintext password to hashed for: ${email}`);
-    }
+    // Plaintext password detected — reject login and flag for migration
+    console.error(`[SECURITY] User ${u.id} has unhashed password. Run the migration script.`);
+    return res.status(401).json(err('Invalid email or password'));
   }
 
   if (!passwordValid) {
@@ -450,35 +687,73 @@ const loginHandler = async (req, res) => {
 
   console.log(`✅ [LOGIN] Successful for: ${email}`);
   const user = formatUser(u);
-  const token = `mock-jwt-token-${user.id}`;
-  res.json(success({ user, token }, 'Login successful'));
+  const practiceIds       = (u.user_practices || []).map(p => p.practice_id);
+  const isSuperAdmin      = (u.user_roles    || []).some(r => r.role_id === 'ROLE_SYSADMIN');
+  const isSuperSuperAdmin = u.role === 'super_super_admin';
+  const token = signToken({ userId: user.id, role: u.role, practiceIds, isSuperAdmin, isSuperSuperAdmin });
+  const refreshToken = randomUUID();
+  await supabase.from('refresh_tokens').insert({
+    user_id:    user.id,
+    token_hash: hashToken(refreshToken),
+    expires_at: Date.now() + REFRESH_TTL_MS,
+  });
+  res.json(success({ user, token, refreshToken }, 'Login successful'));
 };
-app.post('/pma/auth/login', loginHandler);
-app.post('/auth/login',     loginHandler);
+app.post('/pma/auth/login', authLimiter, loginHandler);
+app.post('/auth/login',     authLimiter, loginHandler);
 
 app.post('/pma/auth/logout', async (req, res) => {
+  const { refreshToken } = req.body || {};
+  if (refreshToken) {
+    await supabase.from('refresh_tokens').delete().eq('token_hash', hashToken(refreshToken));
+  }
   res.json(success(null, 'Logged out successfully'));
 });
 app.post('/auth/logout', async (req, res) => {
+  const { refreshToken } = req.body || {};
+  if (refreshToken) {
+    await supabase.from('refresh_tokens').delete().eq('token_hash', hashToken(refreshToken));
+  }
   res.json(success(null, 'Logged out successfully'));
 });
+
+const refreshHandler = async (req, res) => {
+  const { refreshToken } = req.body || {};
+  if (!refreshToken) return res.status(401).json(err('Refresh token required'));
+  const hash = hashToken(refreshToken);
+  const { data: rt } = await supabase.from('refresh_tokens').select('*').eq('token_hash', hash).maybeSingle();
+  if (!rt || rt.expires_at < Date.now()) {
+    if (rt) await supabase.from('refresh_tokens').delete().eq('token_hash', hash);
+    return res.status(401).json(err('Refresh token invalid or expired'));
+  }
+  // Rotate: delete old token, issue new pair
+  await supabase.from('refresh_tokens').delete().eq('token_hash', hash);
+  const { data: u } = await supabase.from('users').select(USER_SELECT).eq('id', rt.user_id).maybeSingle();
+  if (!u || !u.is_active) return res.status(401).json(err('User account not found or inactive'));
+  const practiceIds       = (u.user_practices || []).map(p => p.practice_id);
+  const isSuperAdmin      = (u.user_roles    || []).some(r => r.role_id === 'ROLE_SYSADMIN');
+  const isSuperSuperAdmin = u.role === 'super_super_admin';
+  const newAccessToken = signToken({ userId: u.id, role: u.role, practiceIds, isSuperAdmin, isSuperSuperAdmin });
+  const newRefreshToken = randomUUID();
+  await supabase.from('refresh_tokens').insert({
+    user_id:    u.id,
+    token_hash: hashToken(newRefreshToken),
+    expires_at: Date.now() + REFRESH_TTL_MS,
+  });
+  res.json(success({ token: newAccessToken, refreshToken: newRefreshToken }));
+};
+app.post('/pma/auth/refresh', refreshHandler);
+app.post('/auth/refresh',     refreshHandler);
 
 // ============================================================================
 // SELF-REGISTRATION — Clean server flow (register + email verify link)
 //
 // ============================================================================
 
-app.post('/pma/authentication/register', async (req, res) => {
-  await delay(400);
-  const { email, password, firstname, lastname } = req.body;
-
-  if (!email || !password || !firstname || !lastname) {
-    return res.status(400).json({ message: 'All fields are required' });
-  }
-
-  if (password.length < 6) {
-    return res.status(400).json({ message: 'Password must be at least 6 characters long' });
-  }
+app.post('/pma/authentication/register', authLimiter, async (req, res) => {
+  const data = validate(selfRegisterSchema, req, res);
+  if (!data) return;
+  const { email, password, firstname, lastname } = data;
 
   // Check for existing user (active or pending)
   const { data: existing } = await supabase
@@ -489,8 +764,7 @@ app.post('/pma/authentication/register', async (req, res) => {
 
   const hashedPassword = await hashPassword(password);
 
-  const { count } = await supabase.from('users').select('id', { count: 'exact', head: true });
-  const newId = `USR${String((count || 0) + 1).padStart(3, '0')}`;
+  const newId = randomUUID();
 
   const { error: uErr } = await supabase.from('users').insert({
     id:         newId,
@@ -558,16 +832,9 @@ const ROLE_MAP = {
 };
 
 const registerHandler = async (req, res) => {
-  await delay(400);
-  const { email, password, firstName, lastName, roleId, practiceIds } = req.body;
-
-  if (!email || !password || !firstName || !lastName || !roleId) {
-    return res.status(400).json(err('All fields are required'));
-  }
-
-  if (password.length < 6) {
-    return res.status(400).json(err('Password must be at least 6 characters long'));
-  }
+  const data = validate(adminRegisterSchema, req, res);
+  if (!data) return;
+  const { email, password, firstName, lastName, roleId, practiceIds } = data;
 
   const { data: existing } = await supabase
     .from('users').select('id').eq('email', email).maybeSingle();
@@ -578,8 +845,7 @@ const registerHandler = async (req, res) => {
 
   const hashedPassword = await hashPassword(password);
 
-  const { count } = await supabase.from('users').select('id', { count: 'exact', head: true });
-  const newId = `USR${String((count || 0) + 1).padStart(3, '0')}`;
+  const newId = randomUUID();
 
   const { error: uErr } = await supabase.from('users').insert({
     id: newId,
@@ -618,7 +884,7 @@ const registerHandler = async (req, res) => {
 
   if (roleId === 'ROLE_PRACTITIONER') {
     await supabase.from('doctors').insert({
-      id: `doc-${Date.now()}`, user_id: newId,
+      id: randomUUID(), user_id: newId,
       first_name: firstName, last_name: lastName,
       specialization: 'General Practice', email, phone: '', is_available: true,
     });
@@ -627,19 +893,21 @@ const registerHandler = async (req, res) => {
   const { data: newUserRow } = await supabase
     .from('users').select(USER_SELECT).eq('id', newId).single();
   const newUser = formatUser(newUserRow);
-  const token   = `mock-jwt-token-${newUser.id}`;
+  const regPracticeIds       = (newUserRow?.user_practices || []).map(p => p.practice_id);
+  const regIsSuperAdmin      = (newUserRow?.user_roles    || []).some(r => r.role_id === 'ROLE_SYSADMIN');
+  const regIsSuperSuperAdmin = newUserRow?.role === 'super_super_admin';
+  const token = signToken({ userId: newUser.id, role: newUserRow?.role, practiceIds: regPracticeIds, isSuperAdmin: regIsSuperAdmin, isSuperSuperAdmin: regIsSuperSuperAdmin });
   res.status(201).json(success({ user: newUser, token }, 'Registration successful'));
 };
 
-app.post('/pma/auth/register', registerHandler);
-app.post('/auth/register',     registerHandler);
+app.post('/pma/auth/register', authLimiter, registerHandler);
+app.post('/auth/register',     authLimiter, registerHandler);
 
 // ============================================================================
 // PRACTICES LIST ENDPOINT (for registration dropdown)
 // ============================================================================
 
 const practicesHandler = async (req, res) => {
-  await delay(200);
   const [{ data: practices }, { data: allRoles }, { data: allPPs }] = await Promise.all([
     supabase.from('practices').select('id, name, practice_number'),
     supabase.from('user_roles').select('user_id, practice_id'),
@@ -670,10 +938,9 @@ app.get('/pma/practices', practicesHandler);
 app.get('/practices',     practicesHandler);
 
 app.get('/pma/practices/search', async (req, res) => {
-  await delay(200);
   const { q } = req.query;
   let query = supabase.from('practices').select('id, name, practice_number');
-  if (q) query = query.or(`name.ilike.%${q}%,practice_number.ilike.%${q}%`);
+  if (q) { const sq = sanitizeSearch(q); query = query.or(`name.ilike.%${sq}%,practice_number.ilike.%${sq}%`); }
   const { data: practices } = await query;
   res.json(success((practices || []).map(p => ({
     id: p.id, name: p.name, practiceNumber: p.practice_number,
@@ -681,7 +948,6 @@ app.get('/pma/practices/search', async (req, res) => {
 });
 
 app.get('/pma/practices/:id', async (req, res) => {
-  await delay(200);
   const [{ data: practice }, { data: allUsers }, { data: roleRows }, { data: ppRows }] = await Promise.all([
     supabase.from('practices').select('*, practice_practitioners(*)').eq('id', req.params.id).maybeSingle(),
     supabase.from('users').select('id, first_name, last_name, email, is_active, role'),
@@ -714,7 +980,6 @@ app.get('/pma/practices/:id', async (req, res) => {
 });
 
 app.get('/pma/practices/:id/doctors', async (req, res) => {
-  await delay(200);
   // Find user_ids linked to this practice via practice_practitioners
   const { data: practitioners } = await supabase
     .from('practice_practitioners')
@@ -758,7 +1023,6 @@ app.get('/pma/practices/:id/doctors', async (req, res) => {
 });
 
 app.get('/pma/practices/:id/members', async (req, res) => {
-  await delay(200);
   const [{ data: roleRows }, { data: ppRows }] = await Promise.all([
     supabase.from('user_roles').select('user_id, role_id, role_name').eq('practice_id', req.params.id),
     supabase.from('practice_practitioners').select('user_id, hpcsa_number').eq('practice_id', req.params.id),
@@ -802,12 +1066,12 @@ app.get('/pma/practices/:id/members', async (req, res) => {
 });
 
 const meHandler = async (req, res) => {
-  await delay(300);
-  const token = req.headers.authorization?.replace('Bearer ', '');
-  if (!token) return res.status(401).json(err('No token provided'));
-  const userId = token.replace('mock-jwt-token-', '');
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) return res.status(401).json(err('No token provided'));
+  const payload = verifyToken(authHeader.replace('Bearer ', ''));
+  if (!payload) return res.status(401).json(err('Invalid or expired token'));
   const { data: u } = await supabase
-    .from('users').select(USER_SELECT).eq('id', userId).single();
+    .from('users').select(USER_SELECT).eq('id', payload.userId).single();
   if (!u) return res.status(404).json(err('User not found'));
   res.json(success(formatUser(u)));
 };
@@ -819,7 +1083,6 @@ app.get('/auth/me',     meHandler);
 // ============================================================================
 
 app.get('/pma/users', async (req, res) => {
-  await delay(300);
   console.log('Fetching users with query:', req.query);
   const { page, pageSize } = req.query;
   const { data: users, error: dbErr } = await supabase.from('users').select(USER_SELECT);
@@ -837,14 +1100,12 @@ app.get('/pma/users', async (req, res) => {
 });
 
 app.get('/pma/users/role/:role', async (req, res) => {
-  await delay(300);
   const { data: users } = await supabase
     .from('users').select(USER_SELECT).eq('role', req.params.role);
   res.json(success((users || []).map(formatUser)));
 });
 
 app.get('/pma/users/check-email', async (req, res) => {
-  await delay(200);
   const { email } = req.query;
   if (!email) return res.status(400).json(err('email is required'));
   const { data: user } = await supabase
@@ -854,7 +1115,6 @@ app.get('/pma/users/check-email', async (req, res) => {
 });
 
 app.get('/pma/users/:id', async (req, res) => {
-  await delay(200);
   const { data: u } = await supabase
     .from('users').select(USER_SELECT).eq('id', req.params.id).single();
   if (!u) return res.status(404).json(err('User not found'));
@@ -862,27 +1122,28 @@ app.get('/pma/users/:id', async (req, res) => {
 });
 
 app.post('/pma/users', async (req, res) => {
-  await delay(400);
+  const data = validate(createUserSchema, req, res);
+  if (!data) return;
+  const { email, firstName, lastName, role: uiRole } = data;
   const { data: existing } = await supabase
-    .from('users').select('id').eq('email', req.body.email).maybeSingle();
+    .from('users').select('id').eq('email', email).maybeSingle();
   if (existing) return res.status(400).json(err('A user with this email already exists'));
 
   const uiRoleToRoleId   = { super_admin: 'ROLE_SYSADMIN', doctor: 'ROLE_PRACTITIONER', reception: 'ROLE_ADMIN' };
   const uiRoleToRoleName = { super_admin: 'SystemAdministrator', doctor: 'PracticePractitioner', reception: 'PracticeAdministrator' };
-  const uiRole = req.body.role || 'reception';
+  const resolvedRole = uiRole || 'reception';
 
-  const { count } = await supabase.from('users').select('id', { count: 'exact', head: true });
-  const newId = `USR${String((count || 0) + 1).padStart(3, '0')}`;
+  const newId = randomUUID();
 
   const { error: insertErr } = await supabase.from('users').insert({
-    id: newId, email: req.body.email,
-    first_name: req.body.firstName, last_name: req.body.lastName,
-    is_active: true, role: uiRole,
+    id: newId, email,
+    first_name: firstName, last_name: lastName,
+    is_active: true, role: resolvedRole,
   });
   if (insertErr) return res.status(500).json(err('Failed to create user'));
 
   await supabase.from('user_roles').insert({
-    user_id: newId, role_id: uiRoleToRoleId[uiRole], role_name: uiRoleToRoleName[uiRole],
+    user_id: newId, role_id: uiRoleToRoleId[resolvedRole], role_name: uiRoleToRoleName[resolvedRole],
   });
 
   const { data: newUserRow } = await supabase.from('users').select(USER_SELECT).eq('id', newId).single();
@@ -890,22 +1151,22 @@ app.post('/pma/users', async (req, res) => {
 });
 
 app.put('/pma/users/:id', async (req, res) => {
-  await delay(300);
+  const data = validate(updateUserSchema, req, res);
+  if (!data) return;
   const { data: existing } = await supabase.from('users').select('id').eq('id', req.params.id).maybeSingle();
   if (!existing) return res.status(404).json(err('User not found'));
   const upd = {};
-  if (req.body.firstName !== undefined) upd.first_name = req.body.firstName;
-  if (req.body.lastName  !== undefined) upd.last_name  = req.body.lastName;
-  if (req.body.email     !== undefined) upd.email      = req.body.email;
-  if (req.body.isActive  !== undefined) upd.is_active  = req.body.isActive;
-  if (req.body.role      !== undefined) upd.role       = req.body.role;
+  if (data.firstName !== undefined) upd.first_name = data.firstName;
+  if (data.lastName  !== undefined) upd.last_name  = data.lastName;
+  if (data.email     !== undefined) upd.email      = data.email;
+  if (data.isActive  !== undefined) upd.is_active  = data.isActive;
+  if (data.role      !== undefined) upd.role       = data.role;
   await supabase.from('users').update(upd).eq('id', req.params.id);
   const { data: updated } = await supabase.from('users').select(USER_SELECT).eq('id', req.params.id).single();
   res.json(success(formatUser(updated), 'User updated successfully'));
 });
 
 app.delete('/pma/users/:id', async (req, res) => {
-  await delay(300);
   const { data: existing } = await supabase.from('users').select('id').eq('id', req.params.id).maybeSingle();
   if (!existing) return res.status(404).json(err('User not found'));
   await supabase.from('users').delete().eq('id', req.params.id);
@@ -913,7 +1174,6 @@ app.delete('/pma/users/:id', async (req, res) => {
 });
 
 app.patch('/pma/users/:id/toggle-active', async (req, res) => {
-  await delay(200);
   const { data: existing } = await supabase
     .from('users').select('id, is_active').eq('id', req.params.id).maybeSingle();
   if (!existing) return res.status(404).json(err('User not found'));
@@ -923,9 +1183,9 @@ app.patch('/pma/users/:id/toggle-active', async (req, res) => {
 });
 
 app.post('/pma/users/:id/link-practice', async (req, res) => {
-  await delay(300);
-  const { practiceId, roleId, force } = req.body;
-  if (!practiceId) return res.status(400).json(err('practiceId is required'));
+  const data = validate(linkPracticeSchema, req, res);
+  if (!data) return;
+  const { practiceId, roleId, force } = data;
 
   const { data: practice } = await supabase.from('practices').select('id, name').eq('id', practiceId).maybeSingle();
   if (!practice) return res.status(404).json(err('Practice not found'));
@@ -934,19 +1194,23 @@ app.post('/pma/users/:id/link-practice', async (req, res) => {
   if (!user) return res.status(404).json(err('User not found'));
 
   const otp = String(Math.floor(100000 + Math.random() * 900000));
-  const expiresAt = Date.now() + 300000;
-  if (!global.practiceOtpStore) global.practiceOtpStore = new Map();
-  global.practiceOtpStore.set(otp, { userId: req.params.id, practiceId, practiceOtp: otp, expiresAt });
+  const expiresAt = new Date(Date.now() + 300_000).toISOString();
+  // Clear any previous pending OTPs for this user+practice before inserting a new one
+  await supabase.from('otp_tokens').delete().eq('user_id', req.params.id).eq('context', 'practice-link');
+  await supabase.from('otp_tokens').insert({
+    id: randomUUID(), token: otp,
+    user_id: req.params.id, practice_id: practiceId,
+    context: 'practice-link',
+    expires_at: expiresAt,
+  });
   console.log(`🔗 Practice Link OTP for ${user.email}: ${otp}`);
 
   // Auto-email the OTP if transporter is configured
-  if (emailTransporter) {
-    try {
-      await emailTransporter.sendMail({
-        from: `"PMA Health Hub" <${process.env.SMTP_USER}>`,
-        to: user.email,
-        subject: `Your practice link OTP for ${practice.name}`,
-        html: `
+  sendMailAsync({
+    from: `"PMA Health Hub" <${process.env.SMTP_USER}>`,
+    to: user.email,
+    subject: `Your practice link OTP for ${practice.name}`,
+    html: `
           <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;padding:24px">
             <h2 style="color:#2563eb">Practice Link Verification</h2>
             <p>Hi ${user.first_name},</p>
@@ -959,12 +1223,7 @@ app.post('/pma/users/:id/link-practice', async (req, res) => {
             <p style="color:#999;font-size:12px">If you didn't request this, you can safely ignore this email.</p>
           </div>
         `,
-      });
-      console.log(`✅ [EMAIL] OTP email sent to ${user.email}`);
-    } catch (mailErr) {
-      console.error(`❌ [EMAIL] Failed to send OTP to ${user.email}:`, mailErr.message);
-    }
-  }
+  }, 'practice-link-otp');
 
   const { data: existingLink } = await supabase.from('user_practices')
     .select('id').eq('user_id', req.params.id).eq('practice_id', practiceId).maybeSingle();
@@ -990,16 +1249,16 @@ app.post('/pma/users/:id/link-practice', async (req, res) => {
   }
 
   const { data: updatedUser } = await supabase.from('users').select(USER_SELECT).eq('id', req.params.id).single();
+  const practiceToken = randomUUID();
   res.json(success({
     user: formatUser(updatedUser),
     otp,
-    token: `practice-link-token-${Date.now()}`,
-    link: `${process.env.CLIENT_URL || 'http://localhost:3000'}/verify-link?token=practice-link-token-${Date.now()}`,
+    token: practiceToken,
+    link: `${process.env.CLIENT_URL || 'http://localhost:3000'}/verify-link?token=${practiceToken}`,
   }, 'Practice linked and OTP generated'));
 });
 
 app.get('/pma/users/:id/my-practice', async (req, res) => {
-  await delay(200);
   const { data: userPractices } = await supabase
     .from('user_practices').select('practice_id, practice_name').eq('user_id', req.params.id);
   
@@ -1024,7 +1283,6 @@ app.get('/pma/users/:id/my-practice', async (req, res) => {
 
 // Returns ALL practices the user is linked to (for multi-practice picker)
 app.get('/pma/users/:id/my-practices', async (req, res) => {
-  await delay(200);
 
   // Check if user is super_super_admin — they see ALL practices
   const { data: userRow } = await supabase
@@ -1060,12 +1318,9 @@ app.get('/pma/users/:id/my-practices', async (req, res) => {
 // ============================================================================
 
 app.post('/pma/admin/link-user-to-practice', async (req, res) => {
-  await delay(300);
-  const { email, practiceId, roleId, firstName, lastName, force } = req.body;
-  
-  if (!email || !practiceId || !roleId) {
-    return res.status(400).json(err('email, practiceId, and roleId are required'));
-  }
+  const data = validate(adminLinkSchema, req, res);
+  if (!data) return;
+  const { email, practiceId, roleId, firstName, lastName, force } = data;
 
   // Validate practice exists
   const { data: practice } = await supabase
@@ -1183,7 +1438,7 @@ app.post('/pma/admin/link-user-to-practice', async (req, res) => {
       
     if (!existingDoctor) {
       await supabase.from('doctors').insert({
-        id: `doc-${Date.now()}`,
+        id: randomUUID(),
         user_id: user.id,
         first_name: user.first_name,
         last_name: user.last_name,
@@ -1198,7 +1453,7 @@ app.post('/pma/admin/link-user-to-practice', async (req, res) => {
   // Generate invite link for new users
   let inviteLink = '';
   if (isNewUser) {
-    const token = `invite-${Date.now()}-${user.id}`;
+    const token = randomUUID();
     const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000; // 7 days
     // Persist invite token in DB so it survives server restarts
     await supabase.from('invite_tokens').upsert({
@@ -1214,13 +1469,11 @@ app.post('/pma/admin/link-user-to-practice', async (req, res) => {
     console.log(`📧 [INVITE] New user ${email} invite link: ${inviteLink}`);
 
     // Auto-send email if transporter is configured
-    if (emailTransporter) {
-      try {
-        await emailTransporter.sendMail({
-          from: `"PMA Health Hub" <${process.env.SMTP_USER}>`,
-          to: email,
-          subject: `You've been invited to join ${practice.name}`,
-          html: `
+    sendMailAsync({
+      from: `"PMA Health Hub" <${process.env.SMTP_USER}>`,
+      to: email,
+      subject: `You've been invited to join ${practice.name}`,
+      html: `
             <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;padding:24px">
               <h2 style="color:#2563eb">Welcome to ${practice.name}</h2>
               <p>Hi ${user.first_name},</p>
@@ -1234,12 +1487,7 @@ app.post('/pma/admin/link-user-to-practice', async (req, res) => {
               <p style="color:#999;font-size:12px">This link expires in 7 days. If you didn't expect this email, you can safely ignore it.</p>
             </div>
           `,
-        });
-        console.log(`✅ [EMAIL] Invite email sent to ${email}`);
-      } catch (mailErr) {
-        console.error(`❌ [EMAIL] Failed to send invite to ${email}:`, mailErr.message);
-      }
-    }
+    }, 'new-user-invite');
   }
 
   // Return success response
@@ -1256,11 +1504,9 @@ app.post('/pma/admin/link-user-to-practice', async (req, res) => {
 
 // Send / resend invite email manually
 app.post('/pma/admin/send-invite-email', async (req, res) => {
-  await delay(200);
-  const { email, inviteLink, practiceName, firstName } = req.body;
-  if (!email || !inviteLink) {
-    return res.status(400).json(err('email and inviteLink are required'));
-  }
+  const data = validate(sendInviteEmailSchema, req, res);
+  if (!data) return;
+  const { email, inviteLink, practiceName, firstName } = data;
   if (!emailTransporter) {
     return res.status(503).json(err('Email is not configured on the server. Set SMTP_USER and SMTP_APP_PASS environment variables and restart.'));
   }
@@ -1289,15 +1535,15 @@ app.post('/pma/admin/send-invite-email', async (req, res) => {
     res.json(success(null, `Invite email sent to ${email}`));
   } catch (mailErr) {
     console.error(`❌ [EMAIL] Failed to send invite to ${email}:`, mailErr.message);
-    res.status(500).json(err(`Failed to send email: ${mailErr.message}`));
+    res.status(500).json(err('Failed to send email'));
   }
 });
 
 // Send/resend OTP for a user to link their practice (triggered by admin from Practice Management)
 app.post('/pma/admin/send-otp', async (req, res) => {
-  await delay(200);
-  const { userId, practiceId } = req.body;
-  if (!userId || !practiceId) return res.status(400).json(err('userId and practiceId are required'));
+  const data = validate(sendOtpAdminSchema, req, res);
+  if (!data) return;
+  const { userId, practiceId } = data;
 
   const { data: user } = await supabase.from('users').select('id, email, first_name, last_name').eq('id', userId).maybeSingle();
   if (!user) return res.status(404).json(err('User not found'));
@@ -1305,19 +1551,22 @@ app.post('/pma/admin/send-otp', async (req, res) => {
   if (!practice) return res.status(404).json(err('Practice not found'));
 
   const otp = String(Math.floor(100000 + Math.random() * 900000));
-  const expiresAt = Date.now() + 300000;
-  if (!global.practiceOtpStore) global.practiceOtpStore = new Map();
-  global.practiceOtpStore.set(otp, { userId, practiceId, practiceOtp: otp, expiresAt });
+  const expiresAt = new Date(Date.now() + 300_000).toISOString();
+  await supabase.from('otp_tokens').delete().eq('user_id', userId).eq('context', 'practice-link');
+  await supabase.from('otp_tokens').insert({
+    id: randomUUID(), token: otp,
+    user_id: userId, practice_id: practiceId,
+    context: 'practice-link',
+    expires_at: expiresAt,
+  });
   console.log(`🔗 [SEND-OTP] OTP for ${user.email}: ${otp}`);
 
   let emailed = false;
-  if (emailTransporter) {
-    try {
-      await emailTransporter.sendMail({
-        from: `"PMA Health Hub" <${process.env.SMTP_USER}>`,
-        to: user.email,
-        subject: `Your practice link OTP for ${practice.name}`,
-        html: `
+  sendMailAsync({
+    from: `"PMA Health Hub" <${process.env.SMTP_USER}>`,
+    to: user.email,
+    subject: `Your practice link OTP for ${practice.name}`,
+    html: `
           <div style="font-family:Arial,sans-serif;max-width:560px;margin:0 auto;padding:24px">
             <h2 style="color:#2563eb">Practice Link Verification</h2>
             <p>Hi ${user.first_name},</p>
@@ -1328,22 +1577,17 @@ app.post('/pma/admin/send-otp', async (req, res) => {
             <p style="color:#666;font-size:13px">Enter this code on your Profile page. It expires in 5 minutes.</p>
           </div>
         `,
-      });
-      emailed = true;
-      console.log(`✅ [EMAIL] OTP sent to ${user.email}`);
-    } catch (mailErr) {
-      console.error(`❌ [EMAIL] Failed to send OTP:`, mailErr.message);
-    }
-  }
+  }, 'admin-send-otp');
+  emailed = !!emailTransporter;
 
   res.json(success({ otp, emailed }, emailed ? `OTP sent to ${user.email}` : `OTP generated: ${otp} (email not configured)`));
 });
 
 // Direct link (no OTP) — for linking an existing user to a practice immediately
 app.post('/pma/users/:id/link-practice-direct', async (req, res) => {
-  await delay(300);
-  const { practiceId, roleId, force } = req.body;
-  if (!practiceId) return res.status(400).json(err('practiceId is required'));
+  const data = validate(linkPracticeSchema, req, res);
+  if (!data) return;
+  const { practiceId, roleId, force } = data;
 
   const { data: practice } = await supabase.from('practices').select('id, name').eq('id', practiceId).maybeSingle();
   if (!practice) return res.status(404).json(err('Practice not found'));
@@ -1390,10 +1634,9 @@ app.post('/pma/users/:id/link-practice-direct', async (req, res) => {
 
 // Admin create-and-invite — creates a new user, links to practice, returns invite link
 app.post('/pma/admin/create-and-invite', async (req, res) => {
-  await delay(400);
-  const { email, firstName, lastName, roleId, practiceId, tempPassword } = req.body;
-  if (!email || !firstName || !lastName || !roleId || !practiceId)
-    return res.status(400).json(err('email, firstName, lastName, roleId, and practiceId are required'));
+  const data = validate(createAndInviteSchema, req, res);
+  if (!data) return;
+  const { email, firstName, lastName, roleId, practiceId, tempPassword } = data;
 
   const { data: existing } = await supabase.from('users')
     .select('id').eq('email', email.toLowerCase()).maybeSingle();
@@ -1408,8 +1651,7 @@ app.post('/pma/admin/create-and-invite', async (req, res) => {
   };
   const roleUiMap = { 'ROLE_ADMIN': 'reception', 'ROLE_PRACTITIONER': 'doctor', 'ROLE_SYSADMIN': 'super_admin' };
 
-  const { count } = await supabase.from('users').select('id', { count: 'exact', head: true });
-  const newId = `USR${String((count || 0) + 1).padStart(3, '0')}`;
+  const newId = randomUUID();
   const hashedPw = await hashPassword(tempPassword || 'TempPass123!');
 
   const { error: uErr } = await supabase.from('users').insert({
@@ -1429,14 +1671,14 @@ app.post('/pma/admin/create-and-invite', async (req, res) => {
 
   if (roleId === 'ROLE_PRACTITIONER') {
     await supabase.from('doctors').insert({
-      id: `doc-${Date.now()}`, user_id: newId,
+      id: randomUUID(), user_id: newId,
       first_name: firstName, last_name: lastName,
       specialization: 'General Practice', email: email.toLowerCase(), phone: '', is_available: true,
     });
   }
 
   // Generate invite token — stored in DB so it survives server restarts
-  const token = `invite-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+  const token = randomUUID();
   const expiresAt = Date.now() + 7 * 24 * 60 * 60 * 1000; // 7 days
   await supabase.from('invite_tokens').insert({
     token,
@@ -1456,7 +1698,6 @@ app.post('/pma/admin/create-and-invite', async (req, res) => {
 
 // Verify invite token
 app.get('/pma/auth/signup/verify/:token', async (req, res) => {
-  await delay(200);
   const { data: stored, error: tErr } = await supabase
     .from('invite_tokens').select('*').eq('token', req.params.token).maybeSingle();
   if (tErr || !stored) return res.status(404).json(err('Invalid or expired invite token'));
@@ -1468,11 +1709,10 @@ app.get('/pma/auth/signup/verify/:token', async (req, res) => {
 });
 
 // Set password via invite token
-app.post('/pma/auth/set-password', async (req, res) => {
-  await delay(300);
-  const { token, password } = req.body;
-  if (!token || !password) return res.status(400).json(err('token and password are required'));
-  if (password.length < 6) return res.status(400).json(err('Password must be at least 6 characters'));
+app.post('/pma/auth/set-password', authLimiter, async (req, res) => {
+  const data = validate(setPasswordSchema, req, res);
+  if (!data) return;
+  const { token, password } = data;
   const { data: stored, error: tErr } = await supabase
     .from('invite_tokens').select('*').eq('token', token).maybeSingle();
   if (tErr || !stored) return res.status(400).json(err('Invalid or expired invite token'));
@@ -1492,21 +1732,21 @@ app.post('/pma/auth/set-password', async (req, res) => {
 // ============================================================================
 
 app.post('/pma/practices/verify-otp', async (req, res) => {
-  await delay(300);
-  const { otp, userId } = req.body;
-  if (!otp || !userId) return res.status(400).json(err('OTP and userId are required'));
-  if (!global.practiceOtpStore) return res.status(400).json(err('No OTP verification available'));
+  const data = validate(verifyPracticeOtpSchema, req, res);
+  if (!data) return;
+  const { otp, userId } = data;
 
-  const stored = global.practiceOtpStore.get(otp);
+  const { data: stored } = await supabase.from('otp_tokens')
+    .select('*').eq('token', otp).eq('context', 'practice-link').maybeSingle();
   if (!stored) return res.status(400).json(err('Invalid or expired OTP'));
-  if (stored.userId !== userId) return res.status(400).json(err('OTP does not match the specified user'));
-  if (Date.now() > stored.expiresAt) {
-    global.practiceOtpStore.delete(otp);
+  if (stored.user_id !== userId) return res.status(400).json(err('OTP does not match the specified user'));
+  if (new Date(stored.expires_at) < new Date()) {
+    await supabase.from('otp_tokens').delete().eq('id', stored.id);
     return res.status(400).json(err('OTP has expired'));
   }
 
   const { data: practice } = await supabase
-    .from('practices').select('id, name, practice_number').eq('id', stored.practiceId).maybeSingle();
+    .from('practices').select('id, name, practice_number').eq('id', stored.practice_id).maybeSingle();
   if (!practice) return res.status(404).json(err('Practice not found'));
 
   const { data: user } = await supabase.from('users').select('role').eq('id', userId).maybeSingle();
@@ -1514,7 +1754,7 @@ app.post('/pma/practices/verify-otp', async (req, res) => {
     await supabase.from('users').update({ role: 'reception' }).eq('id', userId);
   }
 
-  global.practiceOtpStore.delete(otp);
+  await supabase.from('otp_tokens').delete().eq('id', stored.id);
   console.log(`✅ Practice link verified for user ${userId} to practice ${practice.name}`);
 
   res.json(success({
@@ -1530,25 +1770,33 @@ app.post('/pma/practices/verify-otp', async (req, res) => {
 // ============================================================================
 
 app.get('/pma/patients', async (req, res) => {
-  await delay(300);
   const { page, pageSize, search, idNumber, ids } = req.query;
-  
+  const { practiceId, isSuperAdmin, isSuperSuperAdmin } = req.userContext || {};
+
   let query = supabase.from('patients').select(PATIENT_SELECT);
-  
+
+  // Scope to practice unless super admin
+  if (!isSuperAdmin && !isSuperSuperAdmin && practiceId) {
+    query = query.eq('practice_id', practiceId);
+  }
+
   if (ids) {
-    query = query.in('id', ids.split(','));
+    query = query.in('id', ids.split(',').map(id => id.trim()).filter(Boolean));
     const { data: patients } = await query;
     return res.json(success((patients || []).map(formatPatient)));
   }
   if (idNumber) query = query.eq('id_number', idNumber);
-  if (search)   query = query.or(
-    `first_name.ilike.%${search}%,last_name.ilike.%${search}%,phone.ilike.%${search}%,id_number.ilike.%${search}%`
-  );
+  if (search) {
+    const safe = sanitizeSearch(search);
+    query = query.or(
+      `first_name.ilike.%${safe}%,last_name.ilike.%${safe}%,phone.ilike.%${safe}%,id_number.ilike.%${safe}%`
+    );
+  }
   const { data: patients, error: dbErr } = await query;
   if (dbErr) return res.status(500).json(err('Failed to fetch patients'));
   const formatted = (patients || []).map(formatPatient);
   if (page && pageSize) {
-    const p = parseInt(page), ps = parseInt(pageSize);
+    const p = parseInt(page), ps = Math.min(parseInt(pageSize), 100);
     const paginated = formatted.slice((p - 1) * ps, (p - 1) * ps + ps);
     return res.json(success({
       data: paginated, total: formatted.length, page: p, pageSize: ps,
@@ -1559,17 +1807,20 @@ app.get('/pma/patients', async (req, res) => {
 });
 
 app.get('/pma/patients/search', async (req, res) => {
-  await delay(300);
   const { q } = req.query;
+  const { practiceId, isSuperAdmin, isSuperSuperAdmin } = req.userContext || {};
   console.log(`🔍 Patient search query: "${q}"`);
   if (!q) return res.json(success([]));
-  let query = supabase
-    .from('patients').select(PATIENT_SELECT)
-    .or(`first_name.ilike.%${q}%,last_name.ilike.%${q}%,id_number.ilike.%${q}%,email.ilike.%${q}%,phone.ilike.%${q}%`);
+  const safe = sanitizeSearch(q);
+  let query = supabase.from('patients').select(PATIENT_SELECT);
+  if (!isSuperAdmin && !isSuperSuperAdmin && practiceId) {
+    query = query.eq('practice_id', practiceId);
+  }
+  query = query.or(`first_name.ilike.%${safe}%,last_name.ilike.%${safe}%,id_number.ilike.%${safe}%,email.ilike.%${safe}%,phone.ilike.%${safe}%`);
   const { data: patients } = await query;
   const results = (patients || []).map(formatPatient);
   results.sort((a, b) => {
-    const qL = q.toLowerCase();
+    const qL = safe.toLowerCase();
     const aId = (a.idNumber || '').toLowerCase();
     const bId = (b.idNumber || '').toLowerCase();
     if (aId === qL && bId !== qL) return -1;
@@ -1583,7 +1834,6 @@ app.get('/pma/patients/search', async (req, res) => {
 });
 
 app.get('/pma/patients/id-number/:idNumber', async (req, res) => {
-  await delay(300);
   const { data: patients } = await supabase
     .from('patients').select(PATIENT_SELECT).eq('id_number', req.params.idNumber);
   if (!patients || patients.length === 0) return res.status(404).json(err('Patient not found'));
@@ -1591,109 +1841,115 @@ app.get('/pma/patients/id-number/:idNumber', async (req, res) => {
 });
 
 app.get('/pma/patients/:id', async (req, res) => {
-  await delay(200);
+  const { practiceId, isSuperAdmin, isSuperSuperAdmin } = req.userContext || {};
   const { data: p } = await supabase
     .from('patients').select(PATIENT_SELECT).eq('id', req.params.id).single();
   if (!p) return res.status(404).json(err('Patient not found'));
+  // Verify patient belongs to requesting user's practice
+  if (!isSuperAdmin && !isSuperSuperAdmin && p.practice_id && practiceId && p.practice_id !== practiceId) {
+    return res.status(403).json(err('Access denied'));
+  }
+  logAudit(req, 'VIEW_PATIENT', req.params.id);
   res.json(success(formatPatient(p)));
 });
 
 app.post('/pma/patients', async (req, res) => {
-  await delay(400);
+  const data = validate(createPatientSchema, req, res);
+  if (!data) return;
   const { data: existing } = await supabase
-    .from('patients').select('id').eq('id_number', req.body.idNumber).maybeSingle();
+    .from('patients').select('id').eq('id_number', data.idNumber).maybeSingle();
   if (existing) return res.status(400).json(err('A patient with this ID number already exists'));
-  const newId = `patient-${Date.now()}`;
+  const newId = randomUUID();
   const now   = new Date().toISOString();
   const { error: insertErr } = await supabase.from('patients').insert({
-    id: newId, first_name: req.body.firstName, last_name: req.body.lastName,
-    date_of_birth: req.body.dateOfBirth, gender: req.body.gender,
-    id_number: req.body.idNumber, phone: req.body.phone, email: req.body.email,
-    practice_id: req.body.practiceId, allergies: req.body.allergies || [],
+    id: newId, first_name: data.firstName, last_name: data.lastName,
+    date_of_birth: data.dateOfBirth, gender: data.gender,
+    id_number: data.idNumber, phone: data.phone, email: data.email,
+    practice_id: data.practiceId, allergies: data.allergies || [],
     created_at: now, updated_at: now,
   });
   if (insertErr) return res.status(500).json(err('Failed to create patient'));
-  if (req.body.address) {
+  if (data.address) {
     await supabase.from('patient_addresses').insert({
-      patient_id: newId, street: req.body.address.street, city: req.body.address.city,
-      province: req.body.address.province,
-      postal_code: req.body.address.postalCode || req.body.address.postal_code,
+      patient_id: newId, street: data.address.street, city: data.address.city,
+      province: data.address.province,
+      postal_code: data.address.postalCode || data.address.postal_code,
     });
   }
-  if (req.body.emergencyContact) {
+  if (data.emergencyContact) {
     await supabase.from('patient_emergency_contacts').insert({
-      patient_id: newId, name: req.body.emergencyContact.name,
-      relationship: req.body.emergencyContact.relationship, phone: req.body.emergencyContact.phone,
+      patient_id: newId, name: data.emergencyContact.name,
+      relationship: data.emergencyContact.relationship, phone: data.emergencyContact.phone,
     });
   }
-  if (req.body.medicalAids) {
+  if (data.medicalAids) {
     const inserts = [];
-    if (req.body.medicalAids.active) inserts.push({
-      patient_id: newId, provider_name: req.body.medicalAids.active.providerName,
-      plan_name: req.body.medicalAids.active.planName,
-      membership_number: req.body.medicalAids.active.membershipNumber, is_active: true,
+    if (data.medicalAids.active) inserts.push({
+      patient_id: newId, provider_name: data.medicalAids.active.providerName,
+      plan_name: data.medicalAids.active.planName,
+      membership_number: data.medicalAids.active.membershipNumber, is_active: true,
     });
-    for (const h of (req.body.medicalAids.history || [])) inserts.push({
+    for (const h of (data.medicalAids.history || [])) inserts.push({
       patient_id: newId, provider_name: h.providerName,
       plan_name: h.planName, membership_number: h.membershipNumber, is_active: false,
     });
     if (inserts.length > 0) await supabase.from('patient_medical_aids').insert(inserts);
   }
+  logAudit(req, 'CREATE_PATIENT', newId);
   const { data: newPatient } = await supabase.from('patients').select(PATIENT_SELECT).eq('id', newId).single();
   res.status(201).json(success(formatPatient(newPatient), 'Patient created successfully'));
 });
 
 app.put('/pma/patients/:id', async (req, res) => {
-  await delay(300);
+  const data = validate(updatePatientSchema, req, res);
+  if (!data) return;
   const { data: existing } = await supabase.from('patients').select('id').eq('id', req.params.id).maybeSingle();
   if (!existing) return res.status(404).json(err('Patient not found'));
   const now = new Date().toISOString();
   const upd = { updated_at: now };
-  if (req.body.firstName   !== undefined) upd.first_name    = req.body.firstName;
-  if (req.body.lastName    !== undefined) upd.last_name     = req.body.lastName;
-  if (req.body.dateOfBirth !== undefined) upd.date_of_birth = req.body.dateOfBirth;
-  if (req.body.gender      !== undefined) upd.gender        = req.body.gender;
-  if (req.body.idNumber    !== undefined) upd.id_number     = req.body.idNumber;
-  if (req.body.phone       !== undefined) upd.phone         = req.body.phone;
-  if (req.body.email       !== undefined) upd.email         = req.body.email;
-  if (req.body.practiceId  !== undefined) upd.practice_id   = req.body.practiceId;
-  if (req.body.allergies   !== undefined) upd.allergies     = req.body.allergies;
+  if (data.firstName   !== undefined) upd.first_name    = data.firstName;
+  if (data.lastName    !== undefined) upd.last_name     = data.lastName;
+  if (data.dateOfBirth !== undefined) upd.date_of_birth = data.dateOfBirth;
+  if (data.gender      !== undefined) upd.gender        = data.gender;
+  if (data.idNumber    !== undefined) upd.id_number     = data.idNumber;
+  if (data.phone       !== undefined) upd.phone         = data.phone;
+  if (data.email       !== undefined) upd.email         = data.email;
+  if (data.practiceId  !== undefined) upd.practice_id   = data.practiceId;
+  if (data.allergies   !== undefined) upd.allergies     = data.allergies;
   await supabase.from('patients').update(upd).eq('id', req.params.id);
-  if (req.body.address) {
+  if (data.address) {
     await supabase.from('patient_addresses').delete().eq('patient_id', req.params.id);
     await supabase.from('patient_addresses').insert({
-      patient_id: req.params.id, street: req.body.address.street, city: req.body.address.city,
-      province: req.body.address.province,
-      postal_code: req.body.address.postalCode || req.body.address.postal_code,
+      patient_id: req.params.id, street: data.address.street, city: data.address.city,
+      province: data.address.province,
+      postal_code: data.address.postalCode || data.address.postal_code,
     });
   }
-  if (req.body.emergencyContact) {
+  if (data.emergencyContact) {
     await supabase.from('patient_emergency_contacts').delete().eq('patient_id', req.params.id);
     await supabase.from('patient_emergency_contacts').insert({
-      patient_id: req.params.id, name: req.body.emergencyContact.name,
-      relationship: req.body.emergencyContact.relationship, phone: req.body.emergencyContact.phone,
+      patient_id: req.params.id, name: data.emergencyContact.name,
+      relationship: data.emergencyContact.relationship, phone: data.emergencyContact.phone,
     });
   }
-  if (req.body.medicalAids) {
+  if (data.medicalAids) {
     await supabase.from('patient_medical_aids').delete().eq('patient_id', req.params.id);
     const inserts = [];
-    if (req.body.medicalAids.active) inserts.push({
-      patient_id: req.params.id, provider_name: req.body.medicalAids.active.providerName,
-      plan_name: req.body.medicalAids.active.planName,
-      membership_number: req.body.medicalAids.active.membershipNumber, is_active: true,
+    if (data.medicalAids.active) inserts.push({
+      patient_id: req.params.id, provider_name: data.medicalAids.active.providerName,
+      plan_name: data.medicalAids.active.planName,
+      membership_number: data.medicalAids.active.membershipNumber, is_active: true,
     });
-    for (const h of (req.body.medicalAids.history || [])) inserts.push({
+    for (const h of (data.medicalAids.history || [])) inserts.push({
       patient_id: req.params.id, provider_name: h.providerName,
       plan_name: h.planName, membership_number: h.membershipNumber, is_active: false,
     });
     if (inserts.length > 0) await supabase.from('patient_medical_aids').insert(inserts);
   }
-  const { data: updated } = await supabase.from('patients').select(PATIENT_SELECT).eq('id', req.params.id).single();
-  res.json(success(formatPatient(updated), 'Patient updated successfully'));
+  logAudit(req, 'UPDATE_PATIENT', req.params.id);
 });
 
 app.get('/pma/patients/:id/beneficiaries', async (req, res) => {
-  await delay(300);
   const { data: bens } = await supabase
     .from('beneficiaries').select('patient_id').eq('main_member_id', req.params.id);
   if (!bens || bens.length === 0) return res.json(success([]));
@@ -1703,9 +1959,8 @@ app.get('/pma/patients/:id/beneficiaries', async (req, res) => {
 });
 
 app.post('/pma/patients/:id/beneficiaries', async (req, res) => {
-  await delay(400);
   const { relationship, ...bData } = req.body;
-  const newId = `patient-${Date.now()}`;
+  const newId = randomUUID();
   const now   = new Date().toISOString();
   await supabase.from('patients').insert({
     id: newId, first_name: bData.firstName, last_name: bData.lastName,
@@ -1721,7 +1976,7 @@ app.post('/pma/patients/:id/beneficiaries', async (req, res) => {
     });
   }
   await supabase.from('beneficiaries').insert({
-    id: `beneficiary-${Date.now()}`, patient_id: newId,
+    id: randomUUID(), patient_id: newId,
     main_member_id: req.params.id, relationship,
   });
   const { data: newPatient } = await supabase.from('patients').select(PATIENT_SELECT).eq('id', newId).single();
@@ -1733,7 +1988,6 @@ app.post('/pma/patients/:id/beneficiaries', async (req, res) => {
 // ============================================================================
 
 app.get('/pma/doctors', async (req, res) => {
-  await delay(300);
   const { ids } = req.query;
   const { practiceId, isSuperAdmin } = req.userContext || {};
   console.log(`Fetching doctors for practiceId=${practiceId}, isSuperAdmin=${isSuperAdmin}, filterIds=${ids || 'none'}`);
@@ -1772,7 +2026,6 @@ app.get('/pma/doctors', async (req, res) => {
 });
 
 app.get('/pma/doctors/:id', async (req, res) => {
-  await delay(200);
   console.log(`Fetching doctor with id=${req.params.id}`);
   const { data: doctor } = await supabase
     .from('doctors').select('*').eq('id', req.params.id).single();
@@ -1781,7 +2034,6 @@ app.get('/pma/doctors/:id', async (req, res) => {
 });
 
 app.get('/pma/doctors/available', async (req, res) => {
-  await delay(300);
   console.log(`Fetching available doctors for date=${req.query.date}, time=${req.query.time}`);
   const { date, time } = req.query;
   const { data: doctors } = await supabase.from('doctors').select('*').eq('is_available', true);
@@ -1802,7 +2054,6 @@ app.get('/pma/doctors/available', async (req, res) => {
 });
 
 app.get('/pma/doctors/:id/schedule', async (req, res) => {
-  await delay(300);
   console.log(`Fetching schedule for doctor with id=${req.params.id}`);
   const { dateFrom, dateTo } = req.query;
   let query = supabase.from('schedules').select('*').eq('doctor_id', req.params.id);
@@ -1813,7 +2064,6 @@ app.get('/pma/doctors/:id/schedule', async (req, res) => {
 });
 
 app.post('/pma/doctors/:id/schedule', async (req, res) => {
-  await delay(300);
   const sd = req.body;
   const { data: existingRow } = await supabase
     .from('schedules').select('id').eq('doctor_id', req.params.id)
@@ -1826,7 +2076,7 @@ app.post('/pma/doctors/:id/schedule', async (req, res) => {
     result = data;
   } else {
     const { data } = await supabase.from('schedules').insert({
-      id: `schedule-${Date.now()}`, doctor_id: req.params.id,
+      id: randomUUID(), doctor_id: req.params.id,
       date: sd.date, start_time: sd.startTime, end_time: sd.endTime, status: sd.status || 'available',
     }).select().single();
     result = data;
@@ -1835,7 +2085,6 @@ app.post('/pma/doctors/:id/schedule', async (req, res) => {
 });
 
 app.patch('/pma/doctors/:id/availability', async (req, res) => {
-  await delay(200);
   const { data: existing } = await supabase.from('doctors').select('id').eq('id', req.params.id).maybeSingle();
   if (!existing) return res.status(404).json(err('Doctor not found'));
   const { data: updated } = await supabase.from('doctors')
@@ -1845,7 +2094,6 @@ app.patch('/pma/doctors/:id/availability', async (req, res) => {
 });
 
 app.get('/pma/schedules/doctor/:doctorId/slots/:date', async (req, res) => {
-  await delay(300);
   const { doctorId, date } = req.params;
   const TIME_SLOTS = [
     '08:00', '08:30', '09:00', '09:30', '10:00', '10:30',
@@ -1883,7 +2131,6 @@ app.get('/pma/schedules/doctor/:doctorId/slots/:date', async (req, res) => {
 // ============================================================================
 
 app.get('/pma/appointments', async (req, res) => {
-  await delay(300);
   console.log(`Fetching appointments with filters: ${JSON.stringify(req.query)}`);
   const { page, pageSize, status, doctorId, patientId, dateFrom, dateTo, lean } = req.query;
   const { practiceId, isSuperAdmin, isSuperSuperAdmin } = req.userContext;
@@ -1956,7 +2203,6 @@ app.get('/pma/appointments', async (req, res) => {
 });
 
 app.get('/pma/appointments/:id', async (req, res) => {
-  await delay(200);
   console.log(`Fetching appointment with id=${req.params.id}`);
   const { data: apt } = await supabase
     .from('appointments').select(APPOINTMENT_SELECT).eq('id', req.params.id).single();
@@ -1965,7 +2211,6 @@ app.get('/pma/appointments/:id', async (req, res) => {
 });
 
 app.get('/pma/appointments/patient/:patientId', async (req, res) => {
-  await delay(300);
   console.log(`Fetching appointments for patientId=${req.params.patientId}`);
   const { data: apts } = await supabase
     .from('appointments').select(APPOINTMENT_SELECT).eq('patient_id', req.params.patientId);
@@ -1973,7 +2218,6 @@ app.get('/pma/appointments/patient/:patientId', async (req, res) => {
 });
 
 app.get('/pma/appointments/doctor/:doctorId', async (req, res) => {
-  await delay(300);
   console.log(`Fetching appointments for doctorId=${req.params.doctorId}`);
   const { data: apts } = await supabase
     .from('appointments').select(APPOINTMENT_SELECT).eq('doctor_id', req.params.doctorId);
@@ -1981,9 +2225,9 @@ app.get('/pma/appointments/doctor/:doctorId', async (req, res) => {
 });
 
 app.post('/pma/appointments', async (req, res) => {
-  await delay(400);
-  console.log(`Booking new appointment with data: ${JSON.stringify(req.body)}`);
-  const data = req.body;
+  const data = validate(createAppointmentSchema, req, res);
+  if (!data) return;
+  console.log(`Booking new appointment with data: ${JSON.stringify(data)}`);
   const { data: conflict } = await supabase.from('appointments').select('id')
     .eq('doctor_id', data.doctorId).eq('date', data.date).eq('start_time', data.startTime)
     .not('status', 'in', '("cancelled","rejected")').maybeSingle();
@@ -1999,7 +2243,7 @@ app.post('/pma/appointments', async (req, res) => {
     const em = m + 30;
     return `${String(h + Math.floor(em / 60)).padStart(2, '0')}:${String(em % 60).padStart(2, '0')}`;
   };
-  const newId = `appointment-${Date.now()}`;
+  const newId = randomUUID();
   const now   = new Date().toISOString();
   await supabase.from('appointments').insert({
     id: newId, patient_id: data.patientId, doctor_id: data.doctorId,
@@ -2013,7 +2257,6 @@ app.post('/pma/appointments', async (req, res) => {
 });
 
 app.post('/pma/appointments/:id/approve-reception', async (req, res) => {
-  await delay(300);
   const { userId } = req.body;
   console.log(`Approving reception for appointment id=${req.params.id} by userId=${userId}`);
   const { data: apt } = await supabase.from('appointments').select('id, status').eq('id', req.params.id).maybeSingle();
@@ -2027,7 +2270,6 @@ app.post('/pma/appointments/:id/approve-reception', async (req, res) => {
 });
 
 app.post('/pma/appointments/:id/approve-doctor', async (req, res) => {
-  await delay(300);
   console.log(`Approving doctor for appointment id=${req.params.id} by userId=${req.body.userId}`);
   const { userId } = req.body;
   const { data: apt } = await supabase.from('appointments').select('id').eq('id', req.params.id).maybeSingle();
@@ -2041,7 +2283,6 @@ app.post('/pma/appointments/:id/approve-doctor', async (req, res) => {
 
 app.post('/pma/appointments/:id/reject', async (req, res) => {
   console.log(`Rejecting appointment id=${req.params.id} with reason: ${req.body.reason}`);
-  await delay(300);
   const { reason } = req.body;
   const { data: apt } = await supabase.from('appointments').select('id').eq('id', req.params.id).maybeSingle();
   if (!apt) return res.status(404).json(err('Appointment not found'));
@@ -2052,7 +2293,6 @@ app.post('/pma/appointments/:id/reject', async (req, res) => {
 });
 
 app.post('/pma/appointments/:id/cancel', async (req, res) => {
-  await delay(300);
   console.log(`Cancelling appointment id=${req.params.id} with reason: ${req.body.reason}`);
   const { data: apt } = await supabase.from('appointments').select('id').eq('id', req.params.id).maybeSingle();
   if (!apt) return res.status(404).json(err('Appointment not found'));
@@ -2063,16 +2303,17 @@ app.post('/pma/appointments/:id/cancel', async (req, res) => {
 });
 
 app.patch('/pma/appointments/:id', async (req, res) => {
-  await delay(300);
-  console.log(`Updating appointment id=${req.params.id} with data: ${JSON.stringify(req.body)}`);
+  const data = validate(patchAppointmentSchema, req, res);
+  if (!data) return;
+  console.log(`Updating appointment id=${req.params.id} with data: ${JSON.stringify(data)}`);
   const { data: apt } = await supabase.from('appointments').select('id').eq('id', req.params.id).maybeSingle();
   if (!apt) return res.status(404).json(err('Appointment not found'));
   const upd = { updated_at: new Date().toISOString() };
-  if (req.body.status    !== undefined) upd.status     = req.body.status;
-  if (req.body.notes     !== undefined) upd.notes      = req.body.notes;
-  if (req.body.date      !== undefined) upd.date       = req.body.date;
-  if (req.body.startTime !== undefined) upd.start_time = req.body.startTime;
-  if (req.body.endTime   !== undefined) upd.end_time   = req.body.endTime;
+  if (data.status    !== undefined) upd.status     = data.status;
+  if (data.notes     !== undefined) upd.notes      = data.notes;
+  if (data.date      !== undefined) upd.date       = data.date;
+  if (data.startTime !== undefined) upd.start_time = data.startTime;
+  if (data.endTime   !== undefined) upd.end_time   = data.endTime;
   const { data: updated } = await supabase.from('appointments')
     .update(upd).eq('id', req.params.id).select(APPOINTMENT_SELECT).single();
   res.json(success(formatAppointment(updated), 'Appointment updated'));
@@ -2095,7 +2336,6 @@ const enrichPP = (pp, usersMap) => {
 };
 
 app.get('/pma/practice', async (req, res) => {
-  await delay(200);
   console.log(`Fetching practice info for userContext: ${JSON.stringify(req.userContext)}`);
 
   // Determine which practice to load — use the user's current practice context
@@ -2155,7 +2395,6 @@ app.get('/pma/practice', async (req, res) => {
 });
 
 app.get('/pma/practice/practitioners', async (req, res) => {
-  await delay(200);
   console.log(`Fetching practice practitioners for userContext: ${JSON.stringify(req.userContext)}`);
   const [{ data: pps }, { data: allUsers }] = await Promise.all([
     supabase.from('practice_practitioners').select('*'),
@@ -2166,7 +2405,6 @@ app.get('/pma/practice/practitioners', async (req, res) => {
 });
 
 app.get('/pma/practice/practitioners/:id', async (req, res) => {
-  await delay(200);
   console.log(`Fetching practice practitioner with id=${req.params.id} for userContext: ${JSON.stringify(req.userContext)}`);
   const [{ data: pp }, { data: allUsers }] = await Promise.all([
     supabase.from('practice_practitioners').select('*').eq('id', req.params.id).maybeSingle(),
@@ -2182,7 +2420,6 @@ app.get('/pma/practice/practitioners/:id', async (req, res) => {
 // ============================================================================
 
 app.get('/pma/visits', async (req, res) => {
-  await delay(300);
   console.log(`Fetching visits with filters: ${JSON.stringify(req.query)} for userContext: ${JSON.stringify(req.userContext)}`);
   const { patientId, doctorId, dateFrom, dateTo, status } = req.query;
   let query = supabase.from('visits').select(VISIT_SELECT);
@@ -2193,39 +2430,36 @@ app.get('/pma/visits', async (req, res) => {
   if (status)    query = query.eq('status', status);
   query = query.order('visit_date', { ascending: false });
   const { data: visits } = await query;
-  const enriched = await Promise.all((visits || []).map(v => enrichVisit(formatVisit(v))));
+  const enriched = await enrichVisitsBatch((visits || []).map(formatVisit));
   res.json(success(enriched));
 });
 
 app.get('/pma/visits/:id', async (req, res) => {
-  await delay(200);
   console.log(`Fetching visit with id=${req.params.id} for userContext: ${JSON.stringify(req.userContext)}`);
   const { data: visit } = await supabase.from('visits').select(VISIT_SELECT).eq('id', req.params.id).maybeSingle();
   if (!visit) return res.status(404).json(err('Visit not found'));
+  logAudit(req, 'VIEW_VISIT', req.params.id);
   res.json(success(await enrichVisit(formatVisit(visit))));
 });
 
 app.get('/pma/visits/patient/:patientId', async (req, res) => {
-  await delay(300);
   console.log(`Fetching visits for patientId=${req.params.patientId} and userContext: ${JSON.stringify(req.userContext)}`);
   const { data: visits } = await supabase.from('visits').select(VISIT_SELECT)
     .eq('patient_id', req.params.patientId).order('visit_date', { ascending: false });
-  const enriched = await Promise.all((visits || []).map(v => enrichVisit(formatVisit(v))));
+  const enriched = await enrichVisitsBatch((visits || []).map(formatVisit));
   res.json(success(enriched));
 });
 
 app.get('/pma/visits/doctor/:doctorId', async (req, res) => {
-  await delay(300);
   console.log(`Fetching visits for doctorId=${req.params.doctorId} and userContext: ${JSON.stringify(req.userContext)}`);
 
   const { data: visits } = await supabase.from('visits').select(VISIT_SELECT)
     .eq('doctor_id', req.params.doctorId).order('visit_date', { ascending: false });
-  const enriched = await Promise.all((visits || []).map(v => enrichVisit(formatVisit(v))));
+  const enriched = await enrichVisitsBatch((visits || []).map(formatVisit));
   res.json(success(enriched));
 });
 
 app.get('/pma/visits/appointment/:appointmentId', async (req, res) => {
-  await delay(200);
   console.log(`Fetching visit for appointmentId=${req.params.appointmentId} and userContext: ${JSON.stringify(req.userContext)}`);
   const { data: visit } = await supabase.from('visits').select(VISIT_SELECT)
     .eq('appointment_id', req.params.appointmentId).maybeSingle();
@@ -2234,11 +2468,11 @@ app.get('/pma/visits/appointment/:appointmentId', async (req, res) => {
 });
 
 app.post('/pma/visits', async (req, res) => {
-  await delay(400);
-  console.log(`Creating new visit with data: ${JSON.stringify(req.body)} and userContext: ${JSON.stringify(req.userContext)}`);
-  const data = req.body;
+  const data = validate(createVisitSchema, req, res);
+  if (!data) return;
+  console.log(`Creating new visit with data: ${JSON.stringify(data)} and userContext: ${JSON.stringify(req.userContext)}`);
   const now = new Date().toISOString();
-  const visitId = `visit-${Date.now()}`;
+  const visitId = randomUUID();
   const { error: insertError } = await supabase.from('visits').insert({
     id: visitId,
     appointment_id: data.appointmentId || null,
@@ -2254,21 +2488,21 @@ app.post('/pma/visits', async (req, res) => {
   });
   if (insertError) {
     console.error('[POST /pma/visits] Insert error:', insertError.message);
-    return res.status(500).json(err('Failed to create visit: ' + insertError.message));
+    return res.status(500).json(err('Failed to create visit'));
   }
   if (data.vitals) {
-    const { error: vErr } = await supabase.from('visit_vitals').insert({ ...snakeKeys(data.vitals), id: `vv-${Date.now()}`, visit_id: visitId });
+    const { error: vErr } = await supabase.from('visit_vitals').insert({ ...snakeKeys(data.vitals), id: randomUUID(), visit_id: visitId });
     if (vErr) console.error('[POST /pma/visits] vitals insert error:', vErr.message);
   }
   if (data.diagnoses?.length) {
     const { error: dErr } = await supabase.from('visit_diagnoses').insert(
-      data.diagnoses.map((d, i) => ({ id: `vd-${Date.now()}-${i}`, ...snakeKeys(d), visit_id: visitId }))
+      data.diagnoses.map((d, i) => ({ id: randomUUID(), ...snakeKeys(d), visit_id: visitId }))
     );
     if (dErr) console.error('[POST /pma/visits] diagnoses insert error:', dErr.message);
   }
   if (data.procedures?.length) {
     const { error: pErr } = await supabase.from('visit_procedures').insert(
-      data.procedures.map((p, i) => ({ id: `vp-${Date.now()}-${i}`, ...snakeKeys(p), visit_id: visitId }))
+      data.procedures.map((p, i) => ({ id: randomUUID(), ...snakeKeys(p), visit_id: visitId }))
     );
     if (pErr) console.error('[POST /pma/visits] procedures insert error:', pErr.message);
   }
@@ -2279,16 +2513,17 @@ app.post('/pma/visits', async (req, res) => {
   }
   const { data: newVisit } = await supabase.from('visits').select(VISIT_SELECT).eq('id', visitId).single();
   if (!newVisit) return res.status(500).json(err('Visit was created but could not be retrieved'));
+  logAudit(req, 'CREATE_VISIT', visitId);
   res.status(201).json(success(await enrichVisit(formatVisit(newVisit)), 'Visit created successfully'));
 });
 
 app.put('/pma/visits/:id', async (req, res) => {
-  await delay(300);
-  console.log(`Updating visit id=${req.params.id} with data: ${JSON.stringify(req.body)} and userContext: ${JSON.stringify(req.userContext)}`);
+  const body = validate(updateVisitSchema, req, res);
+  if (!body) return;
+  console.log(`Updating visit id=${req.params.id} with data: ${JSON.stringify(body)} and userContext: ${JSON.stringify(req.userContext)}`);
   const { data: existing } = await supabase.from('visits').select('id').eq('id', req.params.id).maybeSingle();
   if (!existing) return res.status(404).json(err('Visit not found'));
   const now  = new Date().toISOString();
-  const body = req.body;
   await supabase.from('visits').update({
     reason_for_visit: body.reasonForVisit,
     consultation_notes: body.consultationNotes,
@@ -2321,7 +2556,6 @@ app.put('/pma/visits/:id', async (req, res) => {
 
 app.post('/pma/visits/:id/complete', async (req, res) => {
   console.log(`Completing visit id=${req.params.id} with userContext: ${JSON.stringify(req.userContext)}`);
-  await delay(400);
   const { data: visit } = await supabase.from('visits').select(VISIT_SELECT).eq('id', req.params.id).maybeSingle();
   if (!visit) return res.status(404).json(err('Visit not found'));
   const formatted = formatVisit(visit);
@@ -2333,7 +2567,7 @@ app.post('/pma/visits/:id/complete', async (req, res) => {
     amount: proc.tariffAmount || 0,
   }));
   const totalAmount = lineItems.reduce((sum, li) => sum + li.amount, 0);
-  const invId = `inv-${Date.now()}`;
+  const invId = randomUUID();
   await supabase.from('invoices').insert({
     id: invId, visit_id: req.params.id, patient_id: visit.patient_id,
     total_amount: totalAmount, status: 'issued', created_at: now, paid_at: null,
@@ -2349,11 +2583,11 @@ app.post('/pma/visits/:id/complete', async (req, res) => {
 });
 
 app.get('/pma/patients/:id/clinical-record', async (req, res) => {
-  await delay(300);
   console.log(`Fetching clinical record for patientId=${req.params.id} with userContext: ${JSON.stringify(req.userContext)}`);
   const { data: visits } = await supabase.from('visits').select(VISIT_SELECT)
     .eq('patient_id', req.params.id).order('visit_date', { ascending: false });
-  const enriched = await Promise.all((visits || []).map(v => enrichVisit(formatVisit(v))));
+  const enriched = await enrichVisitsBatch((visits || []).map(formatVisit));
+  logAudit(req, 'VIEW_CLINICAL_RECORD', req.params.id);
   res.json(success({ patientId: req.params.id, doctorVisits: enriched }));
 });
 
@@ -2362,7 +2596,6 @@ app.get('/pma/patients/:id/clinical-record', async (req, res) => {
 // ============================================================================
 
 app.get('/pma/invoices', async (req, res) => {
-  await delay(300);
   console.log(`Fetching all invoices with userContext: ${JSON.stringify(req.userContext)}`);
 
   const { data: invoices } = await supabase.from('invoices').select(INVOICE_SELECT);
@@ -2370,7 +2603,6 @@ app.get('/pma/invoices', async (req, res) => {
 });
 
 app.get('/pma/invoices/:id', async (req, res) => {
-  await delay(200);
   console.log(`Fetching invoice with id=${req.params.id} for userContext: ${JSON.stringify(req.userContext)}`);
   const { data: invoice } = await supabase.from('invoices').select(INVOICE_SELECT).eq('id', req.params.id).maybeSingle();
   if (!invoice) return res.status(404).json(err('Invoice not found'));
@@ -2378,7 +2610,6 @@ app.get('/pma/invoices/:id', async (req, res) => {
 });
 
 app.get('/pma/invoices/visit/:visitId', async (req, res) => {
-  await delay(200);
   console.log(`Fetching invoice for visitId=${req.params.visitId} and userContext: ${JSON.stringify(req.userContext)}`);
   const { data: invoice } = await supabase.from('invoices').select(INVOICE_SELECT).eq('visit_id', req.params.visitId).maybeSingle();
   if (!invoice) return res.status(404).json(err('Invoice not found for this visit'));
@@ -2386,14 +2617,12 @@ app.get('/pma/invoices/visit/:visitId', async (req, res) => {
 });
 
 app.get('/pma/invoices/patient/:patientId', async (req, res) => {
-  await delay(300);
   console.log(`Fetching invoices for patientId=${req.params.patientId} and userContext: ${JSON.stringify(req.userContext)}`);
   const { data: invoices } = await supabase.from('invoices').select(INVOICE_SELECT).eq('patient_id', req.params.patientId);
   res.json(success((invoices || []).map(formatInvoice)));
 });
 
 app.post('/pma/invoices/:id/mark-paid', async (req, res) => {
-  await delay(300);
   console.log(`Marking invoice id=${req.params.id} as paid with userContext: ${JSON.stringify(req.userContext)}`);
   const { data: inv } = await supabase.from('invoices').select('id').eq('id', req.params.id).maybeSingle();
   if (!inv) return res.status(404).json(err('Invoice not found'));
@@ -2408,23 +2637,21 @@ app.post('/pma/invoices/:id/mark-paid', async (req, res) => {
 // ============================================================================
 
 app.get('/pma/codes/diagnoses', async (req, res) => {
-  await delay(200);
   console.log(`Fetching diagnosis codes with query=${req.query.q} and userContext: ${JSON.stringify(req.userContext)}`);
 
   const { q } = req.query;
   let query = supabase.from('diagnosis_codes').select('*');
-  if (q) query = query.or(`code.ilike.%${q}%,description.ilike.%${q}%`);
+  if (q) { const sqd = sanitizeSearch(q); query = query.or(`code.ilike.%${sqd}%,description.ilike.%${sqd}%`); }
   const { data: codes } = await query;
   res.json(success((codes || []).map(toCamel)));
 });
 
 app.get('/pma/codes/procedures', async (req, res) => {
-  await delay(200);
   console.log(`Fetching procedure codes with query=${req.query.q} and userContext: ${JSON.stringify(req.userContext)}`);
 
   const { q } = req.query;
   let query = supabase.from('procedure_codes').select('*');
-  if (q) query = query.or(`code.ilike.%${q}%,description.ilike.%${q}%`);
+  if (q) { const sqp = sanitizeSearch(q); query = query.or(`code.ilike.%${sqp}%,description.ilike.%${sqp}%`); }
   const { data: codes } = await query;
   res.json(success((codes || []).map(toCamel)));
 });
@@ -2434,7 +2661,6 @@ app.get('/pma/codes/procedures', async (req, res) => {
 // ============================================================================
 
 app.post('/pma/appointments/:id/start-consultation', async (req, res) => {
-  await delay(300);
   console.log("start consultation")
   const { data: apt } = await supabase.from('appointments').select('id, status').eq('id', req.params.id).maybeSingle();
   if (!apt) return res.status(404).json(err('Appointment not found'));
@@ -2451,9 +2677,10 @@ app.post('/pma/appointments/:id/start-consultation', async (req, res) => {
 
 const otpStore = new Map();
 
-app.post('/pma/otp/send', async (req, res) => {
-  await delay(500);
-  const { phone, email: emailFromBody, appointmentData } = req.body;
+app.post('/pma/otp/send', otpSendLimiter, async (req, res) => {
+  const data = validate(otpSendSchema, req, res);
+  if (!data) return;
+  const { phone, email: emailFromBody, appointmentData } = data;
 
   if (!emailTransporter) {
     return res.status(500).json(err('Email service is not configured on the server (SMTP_USER / SMTP_APP_PASS missing)'));
@@ -2505,10 +2732,10 @@ app.post('/pma/otp/send', async (req, res) => {
   }
 });
 
-app.post('/pma/otp/verify', async (req, res) => {
-  await delay(300);
-  const { phone, email, code } = req.body;
-  if (!code) return res.status(400).json(err('Verification code is required'));
+app.post('/pma/otp/verify', otpVerifyLimiter, async (req, res) => {
+  const data = validate(otpVerifySchema, req, res);
+  if (!data) return;
+  const { phone, email, code } = data;
 
   // Look up by email first, then phone, then scan store for a phone match
   let key = null;
@@ -2537,7 +2764,7 @@ app.post('/pma/otp/verify', async (req, res) => {
     if (phone) otpStore.delete(phone);
     return res.status(400).json(err('OTP has expired'));
   }
-  if (stored.code === code || code === '000000') {
+  if (stored.code === code) {
     const { appointmentData } = stored;
     otpStore.delete(key);
     if (stored.resolvedEmail) otpStore.delete(stored.resolvedEmail);
@@ -2562,7 +2789,7 @@ app.post('/pma/otp/verify', async (req, res) => {
           const em = m + 30;
           return `${String(h + Math.floor(em / 60)).padStart(2, '0')}:${String(em % 60).padStart(2, '0')}`;
         };
-        const newId = `appointment-${Date.now()}`;
+        const newId = randomUUID();
         const now = new Date().toISOString();
         await supabase.from('appointments').insert({
           id: newId, patient_id: data.patientId, doctor_id: data.doctorId,
@@ -2588,12 +2815,11 @@ app.post('/pma/otp/verify', async (req, res) => {
 // PASSWORD UPDATE UTILITY ENDPOINT
 // ============================================================================
 
-app.post('/pma/auth/update-password', async (req, res) => {
-  console.log(`Updating password for email: ${req.body.email}`);
-
-  const { email, newPassword } = req.body;
-  if (!email || !newPassword) return res.status(400).json(err('Email and new password are required'));
-  if (newPassword.length < 6) return res.status(400).json(err('Password must be at least 6 characters long'));
+app.post('/pma/auth/update-password', authLimiter, async (req, res) => {
+  const data = validate(updatePasswordSchema, req, res);
+  if (!data) return;
+  const { email, newPassword } = data;
+  console.log(`Updating password for email: ${email}`);
   const hashedPassword = await hashPassword(newPassword);
   const { error } = await supabase.from('users').update({ password: hashedPassword }).eq('email', email);
   if (error) {
@@ -2676,7 +2902,7 @@ app.post('/pma/ai/summarise', async (req, res) => {
       return res.status(504).json(err('AI request timed out. The model may be loading — please try again.'));
     }
     console.error('[AI] HF proxy error:', e.message);
-    res.status(502).json(err(`Failed to reach Hugging Face API: ${e.message}`));
+    res.status(502).json(err('AI service temporarily unavailable'));
   }
 });
 
@@ -2699,7 +2925,7 @@ app.use((error, req, res, next) => {
 // START SERVER
 // ============================================================================
 
-app.listen(PORT, () => {
+const server = app.listen(PORT, () => {
   console.log('\n🚀 PMA Health Hub pma Server is running (Supabase)!');
   console.log(`📍 URL: http://localhost:${PORT}`);
   console.log(`🔗 pma Base: http://localhost:${PORT}/pma`);
@@ -2708,6 +2934,7 @@ app.listen(PORT, () => {
   console.log('   Verify Email:   GET   /pma/authentication/verify/:userid');
   console.log('   Admin Register: POST  /pma/auth/register');
   console.log('   Auth:           POST  /pma/auth/login');
+  console.log('   Refresh:        POST  /pma/auth/refresh');
   console.log('   Practices:      GET   /pma/practices');
   console.log('   Users:          GET   /pma/users');
   console.log('   Patients:       GET   /pma/patients');
@@ -2720,3 +2947,19 @@ app.listen(PORT, () => {
   console.log('   Codes:          GET   /pma/codes/procedures');
   console.log('\n✅ Connected to Supabase\n');
 });
+
+const gracefulShutdown = (signal) => {
+  console.log(`\n${signal} received — shutting down gracefully`);
+  server.close(() => {
+    console.log('✅ Server closed gracefully');
+    process.exit(0);
+  });
+  // Force exit if cleanup takes too long
+  setTimeout(() => {
+    console.error('⚠️  Force exit after timeout');
+    process.exit(1);
+  }, 10_000).unref();
+};
+
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+process.on('SIGINT',  () => gracefulShutdown('SIGINT'));
