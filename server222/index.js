@@ -3,6 +3,7 @@ import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import express from 'express';
 import cors from 'cors';
+import helmet from 'helmet';
 import bcrypt from 'bcrypt';
 import nodemailer from 'nodemailer';
 import { supabase } from './supabase.js';
@@ -15,17 +16,11 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 dotenv.config({ path: resolve(__dirname, '.env') });
 
 // ============================================================================
-// STARTUP — fail fast if critical env vars are absent
+// STARTUP — warn about missing optional env vars
 // ============================================================================
-const CRITICAL_ENV = ['SUPABASE_URL', 'SUPABASE_KEY'];
-const missingEnv = CRITICAL_ENV.filter(k => !process.env[k]);
-if (missingEnv.length > 0) {
-  console.error(`\n❌ FATAL: Missing required environment variables: ${missingEnv.join(', ')}`);
-  console.error('   Add them to server22/server222/.env and restart.');
-  process.exit(1);
-}
 if (!process.env.JWT_SECRET) console.warn('⚠️  JWT_SECRET not set in .env — using insecure dev fallback');
 if (!process.env.CLIENT_URL) console.warn('⚠️  CLIENT_URL not set — invite/verification links will use default');
+if (!process.env.SMTP_USER || !process.env.SMTP_APP_PASS) console.warn('⚠️  SMTP credentials not set — email sending disabled');
 const app = express();
 const PORT = process.env.PORT || 5000;
 
@@ -228,7 +223,7 @@ const otpSendSchema = z.object({
 const otpVerifySchema = z.object({
   phone: z.string().max(30).optional(),
   email: email.optional().or(z.literal('')),
-  code:  z.string().length(6).regex(/^\d+$/).or(z.literal('000000')),
+  code:  z.string().length(6).regex(/^\d+$/),
 });
 
 const createVisitSchema = z.object({
@@ -312,14 +307,52 @@ if (emailTransporter) {
   console.log('📧 Email transporter NOT configured (set SMTP_USER and SMTP_APP_PASS to enable)');
 }
 
+// ─── CORS helpers ────────────────────────────────────────────────────────────
+const CORS_METHODS = 'GET,POST,PUT,PATCH,DELETE,OPTIONS';
+const CORS_HEADERS = 'Content-Type,Authorization,X-Practice-Id,Cache-Control,Pragma,Expires';
+
+function getAllowedOrigins() {
+  const base = [
+    'https://staging.d2hsjjwmhjn21g.amplifyapp.com',
+    'http://localhost:8080',
+    'http://localhost:5173',
+    'http://localhost:3000',
+  ];
+  const env = process.env.CLIENT_URL;
+  if (env && !base.includes(env)) base.push(env);
+  return base;
+}
+
+// Handle OPTIONS preflight BEFORE helmet so security headers don't interfere
+app.options('*', (req, res) => {
+  const origin = req.headers.origin;
+  const allowed = getAllowedOrigins();
+  if (origin && allowed.includes(origin)) {
+    res.header('Access-Control-Allow-Origin', origin);
+    res.header('Vary', 'Origin');
+  }
+  res.header('Access-Control-Allow-Methods', CORS_METHODS);
+  res.header('Access-Control-Allow-Headers', CORS_HEADERS);
+  res.header('Access-Control-Max-Age', '86400');
+  res.sendStatus(204);
+});
+
 // Middleware
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+  contentSecurityPolicy: false,
+}));
 app.use(cors({
-  origin: '*',
+  origin: (origin, callback) => {
+    if (!origin) return callback(null, true); // server-to-server / curl
+    const allowed = getAllowedOrigins();
+    if (allowed.includes(origin)) return callback(null, true);
+    callback(new Error(`CORS: origin ${origin} not permitted`));
+  },
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
-  allowedHeaders: '*',
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Practice-Id', 'Cache-Control', 'Pragma', 'Expires'],
   credentials: false,
 }));
-app.options('*', cors());
 app.use(express.json());
 
 // Disable caching for all pma responses
@@ -678,13 +711,9 @@ const loginHandler = async (req, res) => {
   if (u.password.startsWith('$2b$')) {
     passwordValid = await verifyPassword(password, u.password);
   } else {
-    // Plaintext fallback — upgrade to hashed on successful login
-    passwordValid = (password === u.password);
-    if (passwordValid) {
-      const hashed = await hashPassword(password);
-      await supabase.from('users').update({ password: hashed }).eq('id', u.id);
-      console.log(`🔍 [LOGIN] Upgraded plaintext password to hashed for: ${email}`);
-    }
+    // Plaintext password detected — reject login and flag for migration
+    console.error(`[SECURITY] User ${u.id} has unhashed password. Run the migration script.`);
+    return res.status(401).json(err('Invalid email or password'));
   }
 
   if (!passwordValid) {
@@ -1200,9 +1229,15 @@ app.post('/pma/users/:id/link-practice', async (req, res) => {
   if (!user) return res.status(404).json(err('User not found'));
 
   const otp = String(Math.floor(100000 + Math.random() * 900000));
-  const expiresAt = Date.now() + 300000;
-  if (!global.practiceOtpStore) global.practiceOtpStore = new Map();
-  global.practiceOtpStore.set(otp, { userId: req.params.id, practiceId, practiceOtp: otp, expiresAt });
+  const expiresAt = new Date(Date.now() + 300_000).toISOString();
+  // Clear any previous pending OTPs for this user+practice before inserting a new one
+  await supabase.from('otp_tokens').delete().eq('user_id', req.params.id).eq('context', 'practice-link');
+  await supabase.from('otp_tokens').insert({
+    id: randomUUID(), token: otp,
+    user_id: req.params.id, practice_id: practiceId,
+    context: 'practice-link',
+    expires_at: expiresAt,
+  });
   console.log(`🔗 Practice Link OTP for ${user.email}: ${otp}`);
 
   // Auto-email the OTP if transporter is configured
@@ -1551,9 +1586,14 @@ app.post('/pma/admin/send-otp', async (req, res) => {
   if (!practice) return res.status(404).json(err('Practice not found'));
 
   const otp = String(Math.floor(100000 + Math.random() * 900000));
-  const expiresAt = Date.now() + 300000;
-  if (!global.practiceOtpStore) global.practiceOtpStore = new Map();
-  global.practiceOtpStore.set(otp, { userId, practiceId, practiceOtp: otp, expiresAt });
+  const expiresAt = new Date(Date.now() + 300_000).toISOString();
+  await supabase.from('otp_tokens').delete().eq('user_id', userId).eq('context', 'practice-link');
+  await supabase.from('otp_tokens').insert({
+    id: randomUUID(), token: otp,
+    user_id: userId, practice_id: practiceId,
+    context: 'practice-link',
+    expires_at: expiresAt,
+  });
   console.log(`🔗 [SEND-OTP] OTP for ${user.email}: ${otp}`);
 
   let emailed = false;
@@ -1730,18 +1770,18 @@ app.post('/pma/practices/verify-otp', async (req, res) => {
   const data = validate(verifyPracticeOtpSchema, req, res);
   if (!data) return;
   const { otp, userId } = data;
-  if (!global.practiceOtpStore) return res.status(400).json(err('No OTP verification available'));
 
-  const stored = global.practiceOtpStore.get(otp);
+  const { data: stored } = await supabase.from('otp_tokens')
+    .select('*').eq('token', otp).eq('context', 'practice-link').maybeSingle();
   if (!stored) return res.status(400).json(err('Invalid or expired OTP'));
-  if (stored.userId !== userId) return res.status(400).json(err('OTP does not match the specified user'));
-  if (Date.now() > stored.expiresAt) {
-    global.practiceOtpStore.delete(otp);
+  if (stored.user_id !== userId) return res.status(400).json(err('OTP does not match the specified user'));
+  if (new Date(stored.expires_at) < new Date()) {
+    await supabase.from('otp_tokens').delete().eq('id', stored.id);
     return res.status(400).json(err('OTP has expired'));
   }
 
   const { data: practice } = await supabase
-    .from('practices').select('id, name, practice_number').eq('id', stored.practiceId).maybeSingle();
+    .from('practices').select('id, name, practice_number').eq('id', stored.practice_id).maybeSingle();
   if (!practice) return res.status(404).json(err('Practice not found'));
 
   const { data: user } = await supabase.from('users').select('role').eq('id', userId).maybeSingle();
@@ -1749,7 +1789,7 @@ app.post('/pma/practices/verify-otp', async (req, res) => {
     await supabase.from('users').update({ role: 'reception' }).eq('id', userId);
   }
 
-  global.practiceOtpStore.delete(otp);
+  await supabase.from('otp_tokens').delete().eq('id', stored.id);
   console.log(`✅ Practice link verified for user ${userId} to practice ${practice.name}`);
 
   res.json(success({
@@ -2759,7 +2799,7 @@ app.post('/pma/otp/verify', otpVerifyLimiter, async (req, res) => {
     if (phone) otpStore.delete(phone);
     return res.status(400).json(err('OTP has expired'));
   }
-  if (stored.code === code || code === '000000') {
+  if (stored.code === code) {
     const { appointmentData } = stored;
     otpStore.delete(key);
     if (stored.resolvedEmail) otpStore.delete(stored.resolvedEmail);
