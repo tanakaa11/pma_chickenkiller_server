@@ -25,6 +25,8 @@ const loginHandler = async (req, res) => {
   const { email, password } = data;
   console.log('[LOGIN] Attempt received');
 
+  if (!supabase) return res.status(503).json(err('Database not configured — contact admin'));
+
   const { data: userData, error: dbErr } = await supabase
     .from('users').select(USER_SELECT).eq('email', email).eq('is_active', true).maybeSingle();
   if (dbErr) return res.status(500).json(err(`Database error during login: ${dbErr.message}`));

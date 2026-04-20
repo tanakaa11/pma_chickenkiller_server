@@ -22,6 +22,9 @@ import aiRouter        from './routes/ai.js';
 
 const app = express();
 
+// Behind a reverse proxy (Nginx / Lightsail LB) — trust X-Forwarded-For
+app.set('trust proxy', 1);
+
 // ============================================================================
 // SECURITY — helmet first, then cors
 // ============================================================================
