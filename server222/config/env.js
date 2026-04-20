@@ -20,10 +20,19 @@ export const JWT_SECRET = process.env.JWT_SECRET;
 export const SMTP_USER  = process.env.SMTP_USER;
 export const SMTP_PASS  = process.env.SMTP_APP_PASS;
 
+// Extra origins injected via env (comma-separated), e.g. all Amplify preview URLs
+const _envOrigins = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',').map(o => o.trim()).filter(Boolean)
+  : [];
+
 export const ALLOWED_ORIGINS = [
   'https://staging.d2hsjjwmhjn21g.amplifyapp.com',
   'http://localhost:8080',
   'http://localhost:5173',
   'http://localhost:3000',
   ...(process.env.CLIENT_URL ? [process.env.CLIENT_URL] : []),
+  ..._envOrigins,
 ];
+
+// Pattern: allow any *.amplifyapp.com subdomain automatically
+export const AMPLIFY_ORIGIN_REGEX = /^https:\/\/[a-z0-9-]+\.amplifyapp\.com$/i;

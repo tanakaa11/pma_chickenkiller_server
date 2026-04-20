@@ -1,7 +1,7 @@
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
-import { PORT, CLIENT_URL, ALLOWED_ORIGINS } from './config/env.js';
+import { PORT, CLIENT_URL, ALLOWED_ORIGINS, AMPLIFY_ORIGIN_REGEX } from './config/env.js';
 import { addPracticeFilter } from './middleware/practice.js';
 
 // Route modules
@@ -37,6 +37,8 @@ const corsMiddleware = cors({
   origin: (origin, callback) => {
     if (!origin) return callback(null, true);
     if (ALLOWED_ORIGINS.includes(origin)) return callback(null, true);
+    if (AMPLIFY_ORIGIN_REGEX.test(origin)) return callback(null, true);
+    console.warn(`CORS blocked: ${origin}`);
     return callback(new Error(`CORS blocked: ${origin}`));
   },
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
