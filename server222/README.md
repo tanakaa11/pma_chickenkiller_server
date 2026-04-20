@@ -1,53 +1,286 @@
-# Mock API Server
+# PMA Health Hub — Server
 
-This is a fully functional Express.js mock server that serves all the API endpoints for the PMA Health Hub application.
+Express.js REST API server for PMA Health Hub. Uses Supabase (PostgreSQL) as the database, JWT for auth, and Nodemailer (Gmail SMTP) for emails.
 
-## Features
-
-✅ All endpoints from `src/api/endpoints.tsx` implemented  
-✅ Real HTTP requests (no simulation)  
-✅ CORS enabled for frontend  
-✅ Request logging  
-✅ Consistent response format  
-✅ Error handling  
-✅ Network delays simulated  
+---
 
 ## Quick Start
 
-### 1. Install Dependencies
-
 ```bash
-cd server
+# 1. Install dependencies
 npm install
+
+# 2. Copy the env template and fill in your values
+cp .env.example .env   # (or create .env manually — see env vars below)
+
+# 3. Start the server (uses the monolithic index.js)
+npm start              # node index.js
+
+# 4. Or start using the new modular entry point
+node server-new.js
 ```
 
-### 2. Start the Server
+Server runs on **http://localhost:5000** by default.
+
+---
+
+## Required Environment Variables
+
+Create a `.env` file in this folder:
+
+```env
+# Required — server will exit on startup without this
+JWT_SECRET=your_super_secret_key
+
+# Supabase
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_ANON_KEY=your_anon_key
+
+# Email (Gmail SMTP) — optional, disables email features if missing
+SMTP_USER=youremail@gmail.com
+SMTP_APP_PASS=your_gmail_app_password
+
+# Frontend URL — used in invite/verification links
+CLIENT_URL=http://localhost:5173
+
+# Port (optional, defaults to 5000)
+PORT=5000
+
+# AI summarisation (optional)
+HUGGINGFACE_API_KEY=hf_...
+```
+
+---
+
+## Project Structure
+
+```
+server222/
+├── index.js              ← Original monolithic server (2200+ lines) — still works
+├── server-new.js         ← New thin entry point  →  imports server.js
+├── server.js             ← Express app wiring (use this going forward)
+├── supabase.js           ← Supabase client singleton
+│
+├── config/               ← Env + service configuration
+│   ├── env.js            ← Loads .env, exports PORT / CLIENT_URL / ALLOWED_ORIGINS
+│   ├── db.js             ← Re-exports supabase from ../supabase.js
+│   ├── jwt.js            ← JWT_EXPIRY, signToken(), verifyToken(), hashToken()
+│   └── email.js          ← Nodemailer transporter + sendMailAsync()
+│
+├── utils/                ← Pure helpers, no Express dependencies
+│   ├── validation.js     ← All Zod schemas + validate(schema, req, res)
+│   ├── constants.js      ← ROLE_MAP, ROLE_NAMES, ROLE_UI_MAP, withTimeout(), sanitizeSearch()
+│   ├── password.js       ← hashPassword(), verifyPassword()  (bcrypt)
+│   ├── jwt.js            ← Re-exports from config/jwt.js
+│   └── audit.js          ← logAudit(req, action, resourceId) — writes to audit_logs table
+│
+├── helpers/              ← Data formatting tied to Supabase shapes
+│   ├── format.js         ← toCamel(), snakeKeys(), success(), err()
+│   │                        SELECT constants: PATIENT_SELECT, USER_SELECT, etc.
+│   │                        Formatters: formatPatient(), formatUser(), formatVisit(), etc.
+│   │                        enrichPP() — enriches practice_practitioners rows
+│   └── enrichment.js     ← enrichVisit(), enrichVisitsBatch() — async, reads Supabase
+│
+├── middleware/           ← Express middleware functions
+│   ├── practice.js       ← addPracticeFilter — reads X-Practice-Id header,
+│   │                        verifies JWT, injects req.userContext
+│   └── auth.js           ← meHandler — GET /auth/me response handler
+│
+└── routes/               ← One file per resource domain
+    ├── auth.js           ← /pma/auth/* — login, logout, refresh, register, set-password
+    ├── admin.js          ← /pma/admin/* + /pma/auth/register — user creation, invites, OTP admin
+    ├── users.js          ← /pma/users/* — CRUD, toggle-active, link-practice, my-practice(s)
+    ├── patients.js       ← /pma/patients/* — CRUD, search, id-number lookup, beneficiaries
+    ├── doctors.js        ← /pma/doctors/* — list, availability, schedule CRUD
+    ├── schedules.js      ← /pma/schedules/* — slot availability grid
+    ├── appointments.js   ← /pma/appointments/* — full booking workflow
+    ├── visits.js         ← /pma/visits/* — clinical visits + invoice generation on complete
+    ├── practices.js      ← /pma/practices/* — list, search, detail, doctors, members, verify-otp
+    ├── practiceInfo.js   ← /pma/practice/* — current-practice info and practitioners
+    ├── invoices.js       ← /pma/invoices/* — CRUD + mark-paid
+    ├── codes.js          ← /pma/codes/* — diagnosis and procedure code search
+    ├── otp.js            ← /pma/otp/* — guest appointment booking OTP (in-memory store)
+    └── ai.js             ← /pma/ai/* — HuggingFace BART summarisation proxy
+```
+
+---
+
+## How Routing Works
+
+All routes are prefixed with `/pma/`. Some auth endpoints are also available without the prefix for legacy compatibility (e.g. `/auth/login` = `/pma/auth/login`).
+
+| Prefix | Router file |
+|---|---|
+| `/pma/auth` | `routes/auth.js` + `routes/admin.js` |
+| `/pma/admin` | `routes/admin.js` |
+| `/pma/users` | `routes/users.js` |
+| `/pma/patients` | `routes/patients.js` |
+| `/pma/doctors` | `routes/doctors.js` |
+| `/pma/schedules` | `routes/schedules.js` |
+| `/pma/appointments` | `routes/appointments.js` |
+| `/pma/visits` | `routes/visits.js` |
+| `/pma/practices` | `routes/practices.js` |
+| `/pma/practice` | `routes/practiceInfo.js` |
+| `/pma/invoices` | `routes/invoices.js` |
+| `/pma/codes` | `routes/codes.js` |
+| `/pma/otp` | `routes/otp.js` |
+| `/pma/ai` | `routes/ai.js` |
+
+---
+
+## All Responses Follow This Shape
+
+```json
+{ "success": true,  "data": { ... } }
+{ "success": false, "message": "Human-readable error" }
+```
+
+Use the helpers from `helpers/format.js`:
+
+```js
+import { success, err } from '../helpers/format.js';
+
+res.json(success(data));           // { success: true, data }
+res.json(success(data, 'Created')); // { success: true, data, message }
+res.status(404).json(err('Not found')); // { success: false, message: 'Not found' }
+```
+
+---
+
+## How to Add a New Endpoint
+
+### Step 1 — Add it to the right route file
+
+Open the relevant file in `routes/`. Each file exports a single Express `Router`.
+
+```js
+// Example: adding GET /pma/patients/:id/summary to routes/patients.js
+
+import { success, err, PATIENT_SELECT, formatPatient } from '../helpers/format.js';
+import { supabase } from '../supabase.js';
+
+router.get('/:id/summary', async (req, res) => {
+  const { data: p } = await supabase
+    .from('patients')
+    .select(PATIENT_SELECT)
+    .eq('id', req.params.id)
+    .single();
+
+  if (!p) return res.status(404).json(err('Patient not found'));
+  res.json(success(formatPatient(p)));
+});
+```
+
+### Step 2 — Add a Zod schema if the endpoint accepts a body
+
+Open `utils/validation.js` and add your schema, then import and use `validate()` in your handler:
+
+```js
+// utils/validation.js
+export const createSummarySchema = z.object({
+  title: z.string().min(1).max(200),
+});
+
+// routes/patients.js
+import { validate, createSummarySchema } from '../utils/validation.js';
+
+router.post('/:id/summary', async (req, res) => {
+  const data = validate(createSummarySchema, req, res);
+  if (!data) return; // validate() already sent a 400 response
+  // ... continue
+});
+```
+
+### Step 3 — Add formatters for new tables (if needed)
+
+If you're querying a new Supabase table, add the SELECT string and formatter to `helpers/format.js`:
+
+```js
+// helpers/format.js
+export const NOTE_SELECT = 'id, patient_id, content, created_at';
+
+export const formatNote = (n) => ({
+  id: n.id,
+  patientId: n.patient_id,
+  content: n.content,
+  createdAt: n.created_at,
+});
+```
+
+### Step 4 — Register a new router in server.js (new domain only)
+
+Only needed if you're creating a **completely new route file**. Open `server.js` and add:
+
+```js
+import myNewRouter from './routes/myNew.js';
+// ...
+app.use('/pma/mynew', myNewRouter);
+```
+
+---
+
+## Multi-Tenancy (Practice Scoping)
+
+Most endpoints are automatically scoped to a practice via the `addPracticeFilter` middleware, which runs before every route. It reads the `X-Practice-Id` header and the JWT, then injects:
+
+```js
+req.userContext = {
+  userId,
+  practiceId,     // from X-Practice-Id header
+  isSuperAdmin,   // true if role is ROLE_SYSADMIN
+  isSuperSuperAdmin, // true if role is 'super_super_admin'
+}
+```
+
+In your route handlers, scope queries using it:
+
+```js
+const { practiceId, isSuperAdmin } = req.userContext || {};
+if (!isSuperAdmin && practiceId) {
+  query = query.eq('practice_id', practiceId);
+}
+```
+
+---
+
+## Auth Flow
+
+1. `POST /pma/auth/login` → returns `{ token, refreshToken, user }`
+2. JWT access tokens expire in **15 minutes**
+3. `POST /pma/auth/refresh` with `{ refreshToken }` → returns a new `{ token }`
+4. Refresh tokens are SHA-256 hashed and stored in the `refresh_tokens` table (7-day TTL)
+5. `POST /pma/auth/logout` deletes the refresh token from the DB
+
+---
+
+## Role System
+
+| `user.role` (DB) | `roleId` (user_roles table) | Meaning |
+|---|---|---|
+| `super_super_admin` | — | Full system access, sees all practices |
+| `super_admin` | `ROLE_SYSADMIN` | System administrator |
+| `doctor` | `ROLE_PRACTITIONER` | Practitioner — also has a `doctors` row |
+| `reception` | `ROLE_ADMIN` | Practice staff |
+| `unlinked` | — | Registered but not linked to any practice yet |
+
+`ROLE_MAP`, `ROLE_NAMES`, and `ROLE_UI_MAP` in `utils/constants.js` are the single source of truth for mapping between these values.
+
+---
+
+## Switching to the Modular Server
+
+The original `index.js` is still the active entry point (`npm start`). The new modular files are ready but the switch hasn't been made yet. To switch:
 
 ```bash
-npm run dev
+# Option A — update package.json scripts
+#   "start": "node server-new.js"
+
+# Option B — rename files
+mv index.js index.legacy.js
+mv server-new.js index.js
 ```
 
-The server will start on `http://localhost:3000`
-
-### 3. Start Frontend (in another terminal)
-
-```bash
-# From project root
-npm run dev
-```
-
-### Or Run Both Together
-
-```bash
-# From project root
-npm run dev:full
-```
-
-## Server Information
-
-- **Port**: 3000
-- **Base URL**: `http://localhost:3000/api`
-- **CORS**: Enabled for all origins
+Both produce identical behaviour. The modular version is easier to maintain.
 
 ## Available Endpoints
 

@@ -1,8 +1,24 @@
 // supabase.js
 import { createClient } from '@supabase/supabase-js';
+import dotenv from 'dotenv';
+import { resolve, dirname } from 'path';
+import { fileURLToPath } from 'url';
 
-const supabaseUrl = process.env.SUPABASE_URL || 'https://zlapxdrkdgeuouywajzn.supabase.co';
-const supabaseKey = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_KEY ||
-  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpsYXB4ZHJrZGdldW91eXdhanpuIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzE5ODA1NjgsImV4cCI6MjA4NzU1NjU2OH0.-XOockxSL8W5l67sT6z07Hp0iwCqiQmO05KzYiAAQn4';
+const __dirname = dirname(fileURLToPath(import.meta.url));
+dotenv.config({ path: resolve(__dirname, '.env') });
 
-export const supabase = createClient(supabaseUrl, supabaseKey);
+const supabaseUrl = process.env.SUPABASE_URL;
+const supabaseKey = process.env.SUPABASE_SERVICE_KEY;
+
+if (!supabaseUrl) throw new Error('SUPABASE_URL is not set. Add it to server22/server222/.env');
+if (!supabaseKey) throw new Error('SUPABASE_SERVICE_KEY is not set. Add it to server22/server222/.env');
+
+// Using the service role key with persistSession:false ensures RLS is bypassed
+// for all server-side queries. Never expose this client or key to the browser.
+export const supabase = createClient(supabaseUrl, supabaseKey, {
+  auth: {
+    persistSession: false,
+    autoRefreshToken: false,
+    detectSessionInUrl: false,
+  },
+});
