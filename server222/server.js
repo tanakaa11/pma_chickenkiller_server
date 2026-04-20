@@ -163,7 +163,7 @@ export const startServer = () => {
     console.log('   Visits:       GET  /pma/visits');
     console.log('   Invoices:     GET  /pma/invoices');
     console.log('   Health:       GET  /health');
-    console.log('\n✅ Connected to Supabase\n');
+    console.log('');
   });
 
   const gracefulShutdown = (signal) => {
