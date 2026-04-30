@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { supabase } from '../supabase.js';
 import { toCamel, success, err, enrichPP } from '../helpers/format.js';
+import { validate, createPracticeSchema, updatePracticeSchema } from '../utils/validation.js';
 
 const router = Router();
 
@@ -52,6 +53,52 @@ router.get('/practitioners', async (req, res) => {
   ]);
   const usersMap = Object.fromEntries((allUsers || []).map(u => [u.id, u]));
   res.json(success((pps || []).map(pp => enrichPP(pp, usersMap))));
+});
+
+// POST /pma/practice/create
+router.post('/create', async (req, res) => {
+  const data = validate(createPracticeSchema, req, res);
+  if (!data) return;
+  const { name, userId, practiceNumber, address, phoneNumber } = data;
+
+  const { data: practice, error } = await supabase
+    .from('practices')
+    .insert({ name, practice_number: practiceNumber, address, phone_number: phoneNumber })
+    .select()
+    .single();
+
+  if (error) return res.status(500).json(err(error.message));
+
+  await supabase.from('user_roles').insert({
+    user_id: userId, practice_id: practice.id, role_id: 'ROLE_ADMIN', role_name: 'Admin',
+  });
+
+  res.status(201).json(success(toCamel(practice)));
+});
+
+// PUT /pma/practice/update/:id
+router.put('/update/:id', async (req, res) => {
+  const data = validate(updatePracticeSchema, req, res);
+  if (!data) return;
+  const { name, practiceNumber, address, phoneNumber } = data;
+
+  const updates = {};
+  if (name !== undefined) updates.name = name;
+  if (practiceNumber !== undefined) updates.practice_number = practiceNumber;
+  if (address !== undefined) updates.address = address;
+  if (phoneNumber !== undefined) updates.phone_number = phoneNumber;
+
+  const { data: practice, error } = await supabase
+    .from('practices')
+    .update(updates)
+    .eq('id', req.params.id)
+    .select()
+    .single();
+
+  if (error) return res.status(500).json(err(error.message));
+  if (!practice) return res.status(404).json(err('Practice not found'));
+
+  res.json(success(toCamel(practice)));
 });
 
 // GET /pma/practice/practitioners/:id

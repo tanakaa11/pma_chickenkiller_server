@@ -113,11 +113,14 @@ router.post('/', async (req, res) => {
 
   const newId = randomUUID();
   const now   = new Date().toISOString();
+  // Allow patients in patient mode to create records without a practice context
+  const practiceId = data.practiceId || req.userContext?.practiceId || null;
+  
   const { error: insertErr } = await supabase.from('patients').insert({
     id: newId, first_name: data.firstName, last_name: data.lastName,
     date_of_birth: data.dateOfBirth, gender: data.gender, id_number: data.idNumber,
     phone: data.phone, email: data.email,
-    practice_id: data.practiceId || req.userContext?.practiceId || null,
+    practice_id: practiceId,
     allergies: data.allergies || [], created_at: now, updated_at: now,
   });
 

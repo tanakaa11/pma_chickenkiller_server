@@ -140,6 +140,23 @@ export const createVisitSchema = z.object({
 
 export const updateVisitSchema = createVisitSchema.partial();
 
+// ─── Practices ────────────────────────────────────────────────────────────────
+export const createPracticeSchema = z.object({
+  name,
+  userId: z.string().min(1).max(100),
+  practiceNumber: z.string().min(1).max(50),
+  address: z.string().max(300).optional().or(z.literal('')),
+  phoneNumber: z.string().max(30).optional().or(z.literal('')),
+});
+
+export const updatePracticeSchema = z.object({
+  name: name.optional(),
+  userId: z.string().min(1).max(100).optional(),
+  practiceNumber: z.string().min(1).max(50).optional(),
+  address: z.string().max(300).optional().or(z.literal('')),
+  phoneNumber: z.string().max(30).optional().or(z.literal('')),
+});
+
 // ─── Generic request validator ────────────────────────────────────────────────
 export const validate = (schema, req, res) => {
   const result = schema.safeParse(req.body);

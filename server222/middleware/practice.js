@@ -14,6 +14,11 @@ export const addPracticeFilter = async (req, res, next) => {
     '/pma/patients/id-number/',
   ];
 
+  // Allow POST /pma/patients for patient mode (creating patient files without practice context)
+  if (req.method === 'POST' && req.path === '/pma/patients') {
+    return next();
+  }
+
   if (skipPaths.some(path => req.path.startsWith(path))) {
     return next();
   }
