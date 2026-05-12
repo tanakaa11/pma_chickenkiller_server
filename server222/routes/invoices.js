@@ -39,6 +39,47 @@ router.get('/:id', async (req, res) => {
   res.json(success(formatInvoice(invoice)));
 });
 
+// PUT /pma/invoices/:id  — update line items and/or status (admin only)
+router.put('/:id', async (req, res) => {
+  const { lineItems, status } = req.body;
+
+  const { data: inv } = await supabase
+    .from('invoices').select('id, status').eq('id', req.params.id).maybeSingle();
+
+  if (!inv) return res.status(404).json(err('Invoice not found'));
+  if (inv.status === 'paid') return res.status(400).json(err('Paid invoices cannot be edited'));
+  if (inv.status === 'cancelled') return res.status(400).json(err('Cancelled invoices cannot be edited'));
+
+  const totalAmount = (lineItems || []).reduce((sum, item) => sum + (Number(item.amount) || 0), 0);
+
+  const { error: updateErr } = await supabase
+    .from('invoices')
+    .update({ status, total_amount: totalAmount })
+    .eq('id', req.params.id);
+
+  if (updateErr) return res.status(500).json(err('Failed to update invoice'));
+
+  // Replace line items: delete existing rows then insert the new set
+  await supabase.from('invoice_line_items').delete().eq('invoice_id', req.params.id);
+
+  if (lineItems && lineItems.length > 0) {
+    const rows = lineItems.map(item => ({
+      invoice_id: req.params.id,
+      reference_code: item.referenceCode,
+      description: item.description,
+      amount: Number(item.amount) || 0,
+    }));
+    await supabase.from('invoice_line_items').insert(rows);
+  }
+
+  logAudit(req, 'UPDATE_INVOICE', req.params.id);
+
+  const { data: updated } = await supabase
+    .from('invoices').select(INVOICE_SELECT).eq('id', req.params.id).single();
+
+  res.json(success(formatInvoice(updated), 'Invoice updated'));
+});
+
 // POST /pma/invoices/:id/mark-paid
 router.post('/:id/mark-paid', async (req, res) => {
   const { data: inv } = await supabase.from('invoices').select('id').eq('id', req.params.id).maybeSingle();
