@@ -165,6 +165,8 @@ export const startServer = () => {
     console.log('   Appointments: GET  /pma/appointments');
     console.log('   Visits:       GET  /pma/visits');
     console.log('   Invoices:     GET  /pma/invoices');
+    console.log('   Invoice edit: PUT  /pma/invoices/:id');
+    console.log('   Invoice email:POST /pma/invoices/:id/email');
     console.log('   Health:       GET  /health');
     console.log('');
   });
