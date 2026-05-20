@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import { randomInt } from 'crypto';
 import rateLimit from 'express-rate-limit';
 import { supabase } from '../supabase.js';
 import { validate, otpSendSchema, otpVerifySchema } from '../utils/validation.js';
@@ -40,7 +41,7 @@ router.post('/send', otpSendLimiter, async (req, res) => {
   }
   if (!email) return res.status(400).json(err('No email address found for this patient.'));
 
-  const code = String(Math.floor(100000 + Math.random() * 900000));
+  const code = String(randomInt(100000, 1000000));
   const otpEntry = { code, expiresAt: Date.now() + 300000, appointmentData, resolvedEmail: email };
   otpStore.set(email, otpEntry);
   if (phone) otpStore.set(phone, otpEntry);

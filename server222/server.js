@@ -19,6 +19,7 @@ import otpRouter       from './routes/otp.js';
 import invoicesRouter  from './routes/invoices.js';
 import codesRouter     from './routes/codes.js';
 import aiRouter        from './routes/ai.js';
+import auditLogsRouter from './routes/auditLogs.js';
 
 const app = express();
 
@@ -29,11 +30,12 @@ app.set('trust proxy', 1);
 // SECURITY — helmet first, then cors
 // ============================================================================
 app.use(helmet({
-  crossOriginResourcePolicy:  false,
-  crossOriginOpenerPolicy:    false,
-  crossOriginEmbedderPolicy:  false,
-  contentSecurityPolicy:      false,
-  originAgentCluster:         false,
+  // Allow cross-origin reads — required for a REST API consumed by browser clients
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+  // COEP breaks cross-origin API access from browser contexts; leave off for API server
+  crossOriginEmbedderPolicy: false,
+  // CSP is for HTML-serving apps; this server returns JSON only
+  contentSecurityPolicy:     false,
 }));
 
 const corsMiddleware = cors({
@@ -136,6 +138,9 @@ app.use('/pma/codes', codesRouter);
 
 // AI proxy
 app.use('/pma/ai', aiRouter);
+
+// Audit logs
+app.use('/pma/audit-logs', auditLogsRouter);
 
 // ============================================================================
 // ERROR HANDLERS

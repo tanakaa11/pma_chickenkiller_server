@@ -1,20 +1,44 @@
 import { Router } from 'express';
-import { randomUUID } from 'crypto';
+import { randomUUID, randomInt } from 'crypto';
 import rateLimit from 'express-rate-limit';
 import { supabase } from '../supabase.js';
 import { validate, adminRegisterSchema, adminLinkSchema, sendInviteEmailSchema, sendOtpAdminSchema, createAndInviteSchema } from '../utils/validation.js';
 import { USER_SELECT, formatUser, success, err } from '../helpers/format.js';
 import { ROLE_MAP, ROLE_NAMES, ROLE_UI_MAP } from '../utils/constants.js';
 import { hashPassword } from '../utils/password.js';
-import { signToken } from '../config/jwt.js';
+import { signToken, verifyToken } from '../config/jwt.js';
 import { sendMailAsync, emailTransporter } from '../config/email.js';
 import { CLIENT_URL } from '../config/env.js';
 
 const router = Router();
 
+// ── Auth guard ────────────────────────────────────────────────────────────────
+const requireAdmin = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+  if (!authHeader?.startsWith('Bearer ')) {
+    return res.status(401).json({ success: false, message: 'Authentication required' });
+  }
+  const payload = verifyToken(authHeader.replace('Bearer ', ''));
+  if (!payload) {
+    return res.status(401).json({ success: false, message: 'Invalid or expired token. Please log in again.' });
+  }
+  if (!payload.isSuperAdmin && !payload.isSuperSuperAdmin) {
+    return res.status(403).json({ success: false, message: 'Forbidden: admin access required' });
+  }
+  req.userContext = payload;
+  next();
+};
+
+router.use(requireAdmin);
+
 const registerLimiter = rateLimit({
   windowMs: 60 * 60 * 1000, max: 5, standardHeaders: true, legacyHeaders: false,
   message: { success: false, message: 'Too many registration attempts. Please try again later.' },
+});
+
+const sendOtpLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, max: 10, standardHeaders: true, legacyHeaders: false,
+  message: { success: false, message: 'Too many OTP requests. Please try again in 15 minutes.' },
 });
 
 // POST /pma/auth/register  (admin full registration)
@@ -156,7 +180,7 @@ router.post('/send-invite-email', async (req, res) => {
 });
 
 // POST /pma/admin/send-otp
-router.post('/send-otp', async (req, res) => {
+router.post('/send-otp', sendOtpLimiter, async (req, res) => {
   const data = validate(sendOtpAdminSchema, req, res);
   if (!data) return;
   const { userId, practiceId } = data;
@@ -165,7 +189,7 @@ router.post('/send-otp', async (req, res) => {
   const { data: practice } = await supabase.from('practices').select('id, name').eq('id', practiceId).maybeSingle();
   if (!practice) return res.status(404).json(err('Practice not found'));
 
-  const otp = String(Math.floor(100000 + Math.random() * 900000));
+  const otp = String(randomInt(100000, 1000000));
   const expiresAt = new Date(Date.now() + 300_000).toISOString();
   await supabase.from('otp_tokens').delete().eq('user_id', userId).eq('context', 'practice-link');
   await supabase.from('otp_tokens').insert({ id: randomUUID(), token: otp, user_id: userId, practice_id: practiceId, context: 'practice-link', expires_at: expiresAt });

@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { randomUUID } from 'crypto';
+import { randomUUID, randomInt } from 'crypto';
 import { supabase } from '../supabase.js';
 import { validate, createUserSchema, updateUserSchema, linkPracticeSchema } from '../utils/validation.js';
 import { USER_SELECT, formatUser, success, err, toCamel } from '../helpers/format.js';
@@ -10,8 +10,17 @@ import { logAudit } from '../utils/audit.js';
 
 const router = Router();
 
+// ── Auth guard: user management requires super_admin or super_super_admin ─────
+const requireAdmin = (req, res, next) => {
+  const { isSuperAdmin, isSuperSuperAdmin } = req.userContext || {};
+  if (!isSuperAdmin && !isSuperSuperAdmin) {
+    return res.status(403).json({ success: false, message: 'Forbidden: admin access required' });
+  }
+  next();
+};
+
 // GET /pma/users
-router.get('/', async (req, res) => {
+router.get('/', requireAdmin, async (req, res) => {
   const { page, pageSize } = req.query;
   const { data: users, error: dbErr } = await supabase.from('users').select(USER_SELECT);
   if (dbErr) return res.status(500).json(err('Failed to fetch users'));
@@ -25,7 +34,7 @@ router.get('/', async (req, res) => {
 });
 
 // GET /pma/users/role/:role
-router.get('/role/:role', async (req, res) => {
+router.get('/role/:role', requireAdmin, async (req, res) => {
   const { data: users } = await supabase.from('users').select(USER_SELECT).eq('role', req.params.role);
   res.json(success((users || []).map(formatUser)));
 });
@@ -46,7 +55,7 @@ router.get('/:id', async (req, res) => {
 });
 
 // POST /pma/users
-router.post('/', async (req, res) => {
+router.post('/', requireAdmin, async (req, res) => {
   const data = validate(createUserSchema, req, res);
   if (!data) return;
   const { email, firstName, lastName, role: uiRole } = data;
@@ -68,7 +77,7 @@ router.post('/', async (req, res) => {
 });
 
 // PUT /pma/users/:id
-router.put('/:id', async (req, res) => {
+router.put('/:id', requireAdmin, async (req, res) => {
   const data = validate(updateUserSchema, req, res);
   if (!data) return;
   const { data: existing } = await supabase.from('users').select('id').eq('id', req.params.id).maybeSingle();
@@ -85,7 +94,7 @@ router.put('/:id', async (req, res) => {
 });
 
 // DELETE /pma/users/:id
-router.delete('/:id', async (req, res) => {
+router.delete('/:id', requireAdmin, async (req, res) => {
   const { data: existing } = await supabase.from('users').select('id').eq('id', req.params.id).maybeSingle();
   if (!existing) return res.status(404).json(err('User not found'));
   logAudit(req, 'DELETE_USER', req.params.id);
@@ -94,7 +103,7 @@ router.delete('/:id', async (req, res) => {
 });
 
 // PATCH /pma/users/:id/toggle-active
-router.patch('/:id/toggle-active', async (req, res) => {
+router.patch('/:id/toggle-active', requireAdmin, async (req, res) => {
   const { data: existing } = await supabase.from('users').select('id, is_active').eq('id', req.params.id).maybeSingle();
   if (!existing) return res.status(404).json(err('User not found'));
   logAudit(req, 'TOGGLE_USER_ACTIVE', req.params.id);
@@ -104,7 +113,7 @@ router.patch('/:id/toggle-active', async (req, res) => {
 });
 
 // POST /pma/users/:id/link-practice
-router.post('/:id/link-practice', async (req, res) => {
+router.post('/:id/link-practice', requireAdmin, async (req, res) => {
   const data = validate(linkPracticeSchema, req, res);
   if (!data) return;
   const { practiceId, roleId } = data;
@@ -113,7 +122,7 @@ router.post('/:id/link-practice', async (req, res) => {
   const { data: user } = await supabase.from('users').select('id, email, first_name, last_name').eq('id', req.params.id).maybeSingle();
   if (!user) return res.status(404).json(err('User not found'));
 
-  const otp = String(Math.floor(100000 + Math.random() * 900000));
+  const otp = String(randomInt(100000, 1000000));
   const expiresAt = new Date(Date.now() + 300_000).toISOString();
   await supabase.from('otp_tokens').delete().eq('user_id', req.params.id).eq('context', 'practice-link');
   await supabase.from('otp_tokens').insert({
@@ -155,7 +164,7 @@ router.post('/:id/link-practice', async (req, res) => {
 });
 
 // POST /pma/users/:id/link-practice-direct
-router.post('/:id/link-practice-direct', async (req, res) => {
+router.post('/:id/link-practice-direct', requireAdmin, async (req, res) => {
   const data = validate(linkPracticeSchema, req, res);
   if (!data) return;
   const { practiceId, roleId } = data;
